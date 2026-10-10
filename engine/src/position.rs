@@ -534,7 +534,10 @@ impl Position {
         }
         self.stm ^= 1;
         self.hash ^= zob_stm();
-        self.halfmove += 1;
+        // A pass isn't a game move: restart the fifty-move count, which also
+        // keeps repetition detection (bounded by halfmove) from matching
+        // positions across it.
+        self.halfmove = 0;
         self.checkers = 0;
     }
 
@@ -962,8 +965,16 @@ mod tests {
         assert!((0..l.len()).any(|i| p.move_uci(l[i]) == "g7g8n"));
     }
 
-    /// is_pseudo_legal (used on TT and other stored moves) must accept exactly
-    /// the moves the generator produces, for every 16-bit encoding.
+    /// A null move restarts the fifty-move count, so a pass can't make a
+    /// fifty-move draw or a repetition with positions before it.
+    #[test]
+    fn null_move_resets_halfmove() {
+        crate::attacks::init();
+        let mut p = Position::from_fen("R5nk/5K1P/6R1/8/8/8/8/8 b - - 99 1").unwrap();
+        p.make_null();
+        assert_eq!(p.halfmove, 0);
+    }
+
     /// A Chess960 castle prints as king-takes-rook even with UCI_Chess960
     /// off: the king's destination alone could be a plain king move.
     #[test]
@@ -978,6 +989,8 @@ mod tests {
         assert_ne!(pos.parse_move("b8c8"), Some(castle));
     }
 
+    /// is_pseudo_legal (used on TT and other stored moves) must accept exactly
+    /// the moves the generator produces, for every 16-bit encoding.
     #[test]
     fn pseudo_legal_matches_generator_exhaustively() {
         crate::attacks::init();
