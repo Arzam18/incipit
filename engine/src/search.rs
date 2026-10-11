@@ -1387,7 +1387,8 @@ impl Searcher {
                     if child.checkers != 0 {
                         r -= 1;
                     }
-                    if mscore >= (1 << 27) {
+                    // Killers (good captures have their own term above).
+                    if quiet && mscore >= (1 << 27) {
                         r -= 1;
                     }
                     if tt_capture {
