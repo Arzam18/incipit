@@ -886,7 +886,9 @@ pub fn perft(pos: &Position, depth: u32) -> u64 {
 mod tests {
     use super::*;
 
-    /// Positions from random games out of the perft suite (incl. Chess960).
+    /// Positions from random games out of the perft suite, whose last five
+    /// entries are Chess960 positions (kings and rooks off their classical
+    /// squares), so 960 castling is exercised too.
     fn random_positions(per_start: usize, plies: usize) -> Vec<Position> {
         let text = include_str!("../tests/perft.epd");
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;

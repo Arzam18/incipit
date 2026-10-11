@@ -487,3 +487,102 @@ pub fn describe(data: &[u8]) -> Result<String, String> {
     }
     Ok(s)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arch() -> Arch {
+        let mut king_buckets = [0u8; 64];
+        for (sq, b) in king_buckets.iter_mut().enumerate() {
+            *b = (sq / 16) as u8; // four buckets by rank pair
+        }
+        Arch {
+            hidden: 128,
+            king_buckets,
+            mirror: true,
+            activation: ACT_PAIRWISE,
+            output_buckets: 2,
+            qa: 255,
+            qb: 128,
+            scale: 400,
+            description: "test".into(),
+            l1: 16,
+            l1_shared: false,
+            l1_dual: true,
+            l1_skip: false,
+            l1_lin: 4,
+            perm: Vec::new(),
+            l1_shift: 0,
+            l2: 16,
+        }
+    }
+
+    /// A synthetic Bullet quantised.bin for `arch`, every value derived from
+    /// its index, with the blocks also returned separately.
+    #[allow(clippy::type_complexity)]
+    fn bullet_file(
+        a: &Arch,
+    ) -> (Vec<u8>, Vec<i16>, Vec<i16>, Vec<i8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let (h, nkb, nb, l1, l2) = (a.hidden, a.num_king_buckets(), a.output_buckets, a.l1, a.l2);
+        let in2 = 2 * l1; // dual
+        let ftw: Vec<i16> = (0..nkb * 768 * h).map(|i| (i % 1001) as i16 - 500).collect();
+        let ftb: Vec<i16> = (0..h).map(|i| (i * 3) as i16 - 100).collect();
+        let w1: Vec<i8> = (0..nb * l1 * h).map(|i| (i % 255) as i8).collect();
+        let b1: Vec<f32> = (0..nb * l1).map(|i| i as f32 * 0.01).collect();
+        let wm: Vec<f32> = (0..nb * l2 * in2).map(|i| i as f32 * -0.001).collect();
+        let bm: Vec<f32> = (0..nb * l2).map(|i| i as f32 * 0.1).collect();
+        let w2: Vec<f32> = (0..nb * l2).map(|i| i as f32 * 0.5).collect();
+        let b2: Vec<f32> = (0..nb).map(|i| i as f32 + 0.25).collect();
+        let linf: Vec<f32> = (0..nb * a.l1_lin).map(|i| i as f32 * 2.0).collect();
+        let mut d = Vec::new();
+        for v in &ftw {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &ftb {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.extend(w1.iter().map(|&v| v as u8));
+        for v in b1.iter().chain(&wm).chain(&bm).chain(&w2).chain(&b2).chain(&linf) {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        while d.len() % 64 != 0 {
+            d.push(0);
+        }
+        (d, ftw, ftb, w1, b1, wm, bm, w2, b2, linf)
+    }
+
+    /// Converting a Bullet file gives exactly what write_hidden writes from
+    /// the same blocks (readout padded to [bucket][l1]); the header describes
+    /// what was asked for; an identity permutation changes nothing; a short
+    /// or long file is rejected.
+    #[test]
+    fn hidden_net_round_trip() {
+        let a = arch();
+        let (d, ftw, ftb, w1, b1, wm, bm, w2, b2, linf) = bullet_file(&a);
+        let net = convert(&a, "bullet", &d).unwrap();
+        let (nb, l1, nlin) = (a.output_buckets, a.l1, a.l1_lin);
+        let lin: Vec<f32> =
+            (0..nb * l1).map(|i| if i % l1 < nlin { linf[i / l1 * nlin + i % l1] } else { 0.0 }).collect();
+        let direct = write_hidden(&a, &ftw, &ftb, &w1, &b1, Some((&wm, &bm)), &w2, &b2, &lin);
+        assert_eq!(net, direct);
+        let info = describe(&net).unwrap();
+        for want in ["QA 255, QB 128, scale 400", "king buckets: 4, mirrored: true", "2 buckets", "description: test"] {
+            assert!(info.contains(want), "{want:?} missing from:\n{info}");
+        }
+        // The weight block is exactly the layers' sizes after the header.
+        let header = u32::from_le_bytes(net[12..16].try_into().unwrap()) as usize;
+        let (h, nkb, l2, in2) = (a.hidden, a.num_king_buckets(), a.l2, 2 * l1);
+        let weights =
+            2 * (nkb * 768 * h + h) + nb * l1 * h + 4 * (nb * l1 + nb * l2 * (in2 + 1) + nb * l2 + nb + nb * l1);
+        assert_eq!(net.len(), header + weights);
+        let mut id = a.clone();
+        id.perm = (0..h / 2).collect();
+        assert_eq!(convert(&id, "bullet", &d).unwrap(), net);
+        assert!(convert(&a, "bullet", &d[..d.len() - 64]).is_err());
+        let mut long = d.clone();
+        long.extend_from_slice(&[0; 64]);
+        assert!(convert(&a, "bullet", &long).is_err());
+        assert!(convert(&a, "raw", &d).is_err());
+    }
+}
