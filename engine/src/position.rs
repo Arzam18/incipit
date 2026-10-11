@@ -834,12 +834,18 @@ impl Position {
 
     /// UCI text of a move made in this position (or any later position of the
     /// same game, since the castling rooks' home squares never change). With
-    /// UCI_Chess960 castling is written king-takes-rook.
+    /// UCI_Chess960 castling is written king-takes-rook; so is a castle whose
+    /// king or rook isn't on its classical square, since the king's
+    /// destination alone could also be a plain king move (or no move at all).
     pub fn move_uci(&self, m: Move) -> String {
-        if is_castle(m) && CHESS960.load(std::sync::atomic::Ordering::Relaxed) {
+        if is_castle(m) {
             let us = if mfrom(m) < 8 { WHITE } else { BLACK };
-            let rsq = self.rook_sq[castle_right(us, mflag(m) == F_QCASTLE)] as usize;
-            return format!("{}{}", sq_str(mfrom(m)), sq_str(rsq));
+            let right = castle_right(us, mflag(m) == F_QCASTLE);
+            let rsq = self.rook_sq[right] as usize;
+            let standard = mfrom(m) == [4, 60][us] && rsq == [7, 0, 63, 56][right];
+            if CHESS960.load(std::sync::atomic::Ordering::Relaxed) || !standard {
+                return format!("{}{}", sq_str(mfrom(m)), sq_str(rsq));
+            }
         }
         move_str(m)
     }
@@ -956,6 +962,20 @@ mod tests {
 
     /// is_pseudo_legal (used on TT and other stored moves) must accept exactly
     /// the moves the generator produces, for every 16-bit encoding.
+    /// A Chess960 castle prints as king-takes-rook even with UCI_Chess960
+    /// off: the king's destination alone could be a plain king move.
+    #[test]
+    fn nonstandard_castle_prints_king_takes_rook() {
+        crate::attacks::init();
+        let pos = Position::from_fen("rk3br1/pp3np1/2ppbp1p/4p2P/2N1PP2/P3B3/KPP2NPQ/3R1B1R b a - 0 18").unwrap();
+        let mut list = MoveList::new();
+        pos.gen_moves(&mut list, false);
+        let castle = (0..list.len()).map(|i| list[i]).find(|&m| is_castle(m)).expect("a castle");
+        assert_eq!(pos.move_uci(castle), "b8a8");
+        assert_eq!(pos.parse_move("b8a8"), Some(castle));
+        assert_ne!(pos.parse_move("b8c8"), Some(castle));
+    }
+
     #[test]
     fn pseudo_legal_matches_generator_exhaustively() {
         crate::attacks::init();

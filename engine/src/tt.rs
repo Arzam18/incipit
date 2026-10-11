@@ -31,27 +31,80 @@ struct Bucket([Entry; WAYS]);
 /// entry; else the entry with the lowest depth - 8 * age (old and shallow
 /// first), so quiescence stores no longer evict deep or PV entries.
 pub struct TT {
-    table: Vec<Bucket>,
+    table: Table,
     gen: u8,
+}
+
+/// The buckets: zeroed memory straight from the allocator, 64-byte aligned
+/// by hand. A zeroed request at the type's own alignment (64) is served
+/// by clearing the memory, which touches every page; one at a plain
+/// alignment is a calloc, whose large allocations come from the OS as
+/// untouched zero pages, so a big table costs only the memory the search
+/// goes on to use. An all-zero bucket is four empty entries.
+struct Table {
+    base: *mut u8,
+    layout: std::alloc::Layout,
+    buckets: *mut Bucket,
+    len: usize,
+}
+
+// The allocation is owned exclusively, like a Box<[Bucket]>.
+unsafe impl Send for Table {}
+unsafe impl Sync for Table {}
+
+impl Table {
+    fn new(len: usize) -> Option<Table> {
+        let align = std::mem::align_of::<Bucket>();
+        let layout =
+            std::alloc::Layout::from_size_align(len.checked_mul(std::mem::size_of::<Bucket>())? + align, 16).ok()?;
+        // SAFETY: the layout has a non-zero size.
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        if base.is_null() {
+            return None;
+        }
+        // SAFETY: the extra `align` bytes leave room for the offset.
+        let buckets = unsafe { base.add(base.align_offset(align)) } as *mut Bucket;
+        Some(Table { base, layout, buckets, len })
+    }
+}
+
+impl Drop for Table {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout.
+        unsafe { std::alloc::dealloc(self.base, self.layout) }
+    }
+}
+
+impl std::ops::Deref for Table {
+    type Target = [Bucket];
+    fn deref(&self) -> &[Bucket] {
+        // SAFETY: `buckets` is aligned, zero-initialised (valid) and `len` long.
+        unsafe { std::slice::from_raw_parts(self.buckets, self.len) }
+    }
+}
+
+impl std::ops::DerefMut for Table {
+    fn deref_mut(&mut self) -> &mut [Bucket] {
+        unsafe { std::slice::from_raw_parts_mut(self.buckets, self.len) }
+    }
 }
 
 impl TT {
     pub fn new(mb: usize) -> TT {
-        let n = ((mb.max(1) * 1024 * 1024) / std::mem::size_of::<Bucket>()).max(1);
-        TT { table: vec![Bucket::default(); n], gen: 0 }
+        Self::try_new(mb).unwrap_or_else(|| {
+            eprintln!("error: cannot allocate a {} MB hash table", mb);
+            std::process::exit(1)
+        })
     }
-    /// As `new`, but None instead of aborting when the memory isn't there.
+    /// As `new`, but None instead of aborting when the memory isn't there
+    /// (see `Table` for why a big table is cheap until used).
     pub fn try_new(mb: usize) -> Option<TT> {
         let n = ((mb.max(1) * 1024 * 1024) / std::mem::size_of::<Bucket>()).max(1);
-        let mut table = Vec::new();
-        table.try_reserve_exact(n).ok()?;
-        table.resize(n, Bucket::default());
-        Some(TT { table, gen: 0 })
+        Some(TT { table: Table::new(n)?, gen: 0 })
     }
     pub fn clear(&mut self) {
-        for b in self.table.iter_mut() {
-            *b = Bucket::default();
-        }
+        // SAFETY: all-zero buckets are valid (and empty).
+        unsafe { std::ptr::write_bytes(self.table.as_mut_ptr(), 0, self.table.len()) };
         self.gen = 0;
     }
     /// Starts a new search: entries written before it age by one.

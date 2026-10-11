@@ -373,15 +373,8 @@ fn score_str(s: i32) -> String {
 
 impl Searcher {
     pub fn new(hash_mb: usize, stop_flag: Arc<AtomicBool>) -> Searcher {
-        let mut lmr = Box::new([[0i32; 64]; 64]);
-        for d in 1..64 {
-            for m in 1..64 {
-                lmr[d][m] = (tp(P::LmrBaseX100) as f64 / 100.0
-                    + (d as f64).ln() * (m as f64).ln() / (tp(P::LmrDivX100) as f64 / 100.0))
-                    as i32;
-            }
-        }
-        Searcher {
+        let lmr = Box::new([[0i32; 64]; 64]);
+        let mut s = Searcher {
             tt: TT::new(hash_mb),
             eval_cache: vec![0u64; eval_cache_entries(EVAL_CACHE_KB)].into_boxed_slice(),
             eval_mask: eval_cache_entries(EVAL_CACHE_KB) - 1,
@@ -426,7 +419,9 @@ impl Searcher {
             eval_scratch: nnue::Scratch::new(),
             root_pos: Position::empty(),
             refresh_cache: nnue::RefreshCache::new(),
-        }
+        };
+        s.init_lmr();
+        s
     }
 
     pub fn init_lmr(&mut self) {
@@ -751,8 +746,8 @@ impl Searcher {
             self.pt.root_fail_low = false;
             let mut fail_lows = 0;
             let mut s;
+            self.seldepth = 0;
             loop {
-                self.seldepth = 0;
                 s = self.negamax(root, a, b, d, 0, false);
                 if self.stopped {
                     break;
@@ -1703,19 +1698,10 @@ impl Searcher {
                 }
             }
         }
+        // In check, evasions are only skipped once three were legal, so no
+        // legal move at all means checkmate.
         if in_check && legal == 0 {
-            // need to verify no legal moves at all (we may have skipped some)
-            let mut any = false;
-            for i in 0..list.len() {
-                let mut c = *pos;
-                if c.make_move(list[i]) {
-                    any = true;
-                    break;
-                }
-            }
-            if !any {
-                return -MATE + ply as i32;
-            }
+            return -MATE + ply as i32;
         }
         let bound = if best >= beta {
             BOUND_LOWER

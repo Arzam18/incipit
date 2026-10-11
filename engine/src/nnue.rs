@@ -1,13 +1,34 @@
 // NNUE inference. The architecture is read from the network's header (see
 // docs/net-format.md): (768 x king buckets -> H) x 2 perspectives, with
-// optional horizontal mirroring, a SCReLU or CReLU activation, and a
-// material-count output-bucketed output layer, or one hidden layer of
-// L1_SIZE neurons (int8) before it.
+// optional horizontal mirroring, a SCReLU, CReLU or pairwise activation,
+// and a material-count output-bucketed output layer, or before it one
+// hidden layer of 8 or 16 neurons (int8) and optionally a second one
+// (f32), with the dual, linear-skip and pre-activation readout variants
+// described there.
 use crate::attacks::Bits;
+
+// Every x86-64 kernel below is written with AVX2 intrinsics (the x86-64-v3
+// baseline that .cargo/config.toml and the Makefile set); without the
+// feature they would still compile but run as function calls, or not run.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+compile_error!("Incipit needs AVX2 on x86-64: build with make, or RUSTFLAGS=\"-C target-cpu=x86-64-v3\"");
 use crate::position::*;
 
 /// Largest hidden size the accumulators can hold.
 pub const MAX_H: usize = 2048;
+
+/// An accumulator is the bias plus at most 32 feature rows (every piece on
+/// the board), summed in i16 with wrapping adds; reject a net where that
+/// could wrap, since both the incremental and the refresh path would do so
+/// identically and no check would notice.
+fn check_ft_range(ftw: &[i16], ftb: &[i16]) -> Result<(), String> {
+    let max = |v: &[i16]| v.iter().map(|&x| (x as i32).abs()).max().unwrap_or(0);
+    let (w, b) = (max(ftw), max(ftb));
+    if 32 * w + b > i16::MAX as i32 {
+        return Err(format!("feature transformer weights up to {} and biases up to {} can overflow i16", w, b));
+    }
+    Ok(())
+}
 
 const MAGIC: &[u8; 8] = b"INCPTNET";
 const TAG_INPUTS: u16 = 0x0001;
@@ -324,7 +345,13 @@ pub fn load(d: &[u8]) -> Result<Network, String> {
     };
     let ftw = i16s(nkb * 768 * h);
     let ftb = i16s(h);
+    check_ft_range(&ftw, &ftb)?;
     let ow = i16s(buckets * 2 * h);
+    // The output kernels multiply clamp(a) * w in i16 before widening.
+    let max_ow = ow.iter().map(|&w| (w as i32).abs()).max().unwrap_or(0);
+    if max_ow * qa > i16::MAX as i32 {
+        return Err(format!("output weights up to {} overflow i16 against QA {}", max_ow, qa));
+    }
     let ob = if bias_size == 2 {
         i16s(buckets).iter().map(|&b| i32::from(b)).collect()
     } else {
@@ -456,6 +483,7 @@ fn load_hidden(
     };
     let ftw = i16s(n_ftw);
     let ftb = i16s(h);
+    check_ft_range(&ftw, &ftb)?;
     // File: [bucket][out][in]. Kernels want each group of 4 inputs for all
     // outputs together: [bucket][in / 4][out][in % 4].
     let mut w1 = AlignedI8::zeroed(nb1 * ln * inl);

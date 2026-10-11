@@ -174,7 +174,12 @@ impl Uci {
                         self.hist.push(pos.hash);
                         pos.make_move(m);
                     }
-                    None => break,
+                    None => {
+                        // Say so: silently stopping here leaves the engine on a
+                        // different position from the GUI's.
+                        println!("info string illegal move {}: the moves from it on are ignored", mstr);
+                        break;
+                    }
                 }
             }
         }
