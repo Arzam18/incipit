@@ -103,6 +103,11 @@ params! {
     CorrUpdateCap = "CorrUpdateCap", 16, 4, 64, 3;
     CorrDiffClamp = "CorrDiffClamp", 400, 100, 1000, 45;
     CorrLimit = "CorrLimit", 64, 16, 256, 12;
+    // Network output multiplier in percent, applied to every search eval. Lets a
+    // net trained on differently scaled labels be run at Incipit's eval scale
+    // (which the pruning margins and other cp thresholds are tuned to) without
+    // retuning them. Step 0 keeps it out of tune-spec; set it per test.
+    EvalScale = "EvalScale", 100, 25, 400, 0;
     // Feature switches for ablation tests (1 = on, 0 = off). Step 0 keeps them out of
     // tune-spec; OpenBench builds advertise them, so a test can set e.g. UseProbcut=0.
     UseTtCut = "UseTtCut", 1, 0, 1, 0;

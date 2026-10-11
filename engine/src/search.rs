@@ -584,7 +584,13 @@ impl Searcher {
         let e = if cfg!(feature = "hce") {
             crate::eval::evaluate(pos)
         } else {
-            nnue::evaluate(&self.acc[ply], pos, &mut self.eval_scratch)
+            let e = nnue::evaluate(&self.acc[ply], pos, &mut self.eval_scratch);
+            // A constant (folded away) outside tune builds.
+            if tp(P::EvalScale) != 100 {
+                e * tp(P::EvalScale) / 100
+            } else {
+                e
+            }
         };
         let e = e.clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
         *slot = (pos.hash & !0xffff) | (e as i16 as u16 as u64);
