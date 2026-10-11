@@ -109,7 +109,7 @@ entry per LAYER, in order:
 
 | Size | Field |
 |---|---|
-| 4 | Input shift (u32): for an integer layer fed by the SCReLU feature transformer, its inputs are `clamp(a, 0, QA)² >> shift`, as u8 (must fit 0..127) |
+| 4 | Input shift (u32): for an integer layer fed by the SCReLU feature transformer, its inputs are `clamp(a, 0, QA)² >> shift`, rounded to nearest, as u8 (must fit 0..127) |
 | 4 | Weight scale (i32): integer weights are real weights times this; `0` for float layers |
 
 **`0x8001` DESCRIPTION** (optional). UTF-8 text: the training run, data and
@@ -164,7 +164,7 @@ With one hidden layer (two LAYERs: `2H -> N`, SCReLU, i8 weights, f32 biases;
 then `N -> 1`, f32; both per output bucket; the engine supports N = 8 and 16,
 and `H -> N` with the pairwise activation):
 
-* `x = clamp(a, 0, QA)² >> shift` as u8, side to move's accumulator first;
+* `x = (clamp(a, 0, QA)² + 2^(shift−1)) >> shift` as u8 (round to nearest), side to move's accumulator first;
 * `z[n] = Σ x · w1[bucket][n]` (integer), then
   `h[n] = clamp(z[n] / (S · W) + b1[bucket][n], 0, 1)²` with `S = QA² / 2^shift`
   (one input unit) and `W` the weight scale;
