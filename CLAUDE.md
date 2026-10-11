@@ -7,6 +7,7 @@ While working on Incipit, do not read or open:
 - **Any other chess engine's source code, commit history, issues, or documentation**, whether on disk, on GitHub, or anywhere on the web. This applies to **every** engine regardless of license, **including other engines by Incipit's author (e.g. Coda, GoChess)**. The one exception is build, release and test tooling (section 2).
 - **Pages/docs describing a specific engine's internals**, even on general sites such as the Chess Programming Wiki.
 - **Another engine's networks, tuned parameters, or training data.**
+  *Exception (owner, 2026-10-11):* LC0 training data (ODbL), converted with approved tooling, may be used for side experiments only. It is kept in separate directories and never mixed into Incipit's sets, and the resulting nets are never used for datagen or releases, so that external data is never in any way absorbed into Incipit's release nets or production training data.
 - **Another project's agent memory, skills, or project directory** (e.g. Coda's), wherever they are on disk. Incipit agents use only Incipit's own project directory and memory.
 
 Searching the web for a technique is fine, but don't open results that are an engine's code, docs or internals.
