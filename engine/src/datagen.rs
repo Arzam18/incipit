@@ -54,7 +54,11 @@ fn insufficient(pos: &Position) -> bool {
     n == 3 && (pos.pieces[KNIGHT] | pos.pieces[BISHOP]) != 0
 }
 
-pub fn run(threads: usize, prefix: &str, nodes: u64, seconds: u64) {
+/// Self-play for `seconds` on `threads` threads, each appending whole
+/// records to `{prefix}_{thread}.bin` (an existing file is extended, never
+/// truncated) and flushing every 200 of its own games. `seed` makes a run
+/// reproducible (0: from the clock).
+pub fn run(threads: usize, prefix: &str, nodes: u64, seconds: u64, seed: u64) {
     let total_pos = Arc::new(AtomicU64::new(0));
     let total_games = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
@@ -64,10 +68,19 @@ pub fn run(threads: usize, prefix: &str, nodes: u64, seconds: u64) {
         let total_pos = total_pos.clone();
         let total_games = total_games.clone();
         hs.push(std::thread::spawn(move || {
-            let seed = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)
-                ^ ((t as u64 + 1) * 0x9E3779B97F4A7C15);
-            let mut rng = Rng(seed | 1);
-            let mut f = std::io::BufWriter::new(std::fs::File::create(format!("{}_{}.bin", prefix, t)).unwrap());
+            let base = if seed != 0 {
+                seed
+            } else {
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+            };
+            let mut rng = Rng((base ^ ((t as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15))) | 1);
+            let path = format!("{}_{}.bin", prefix, t);
+            let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap_or_else(|e| {
+                eprintln!("{}: {}", path, e);
+                std::process::exit(1)
+            });
+            let mut f = std::io::BufWriter::new(file);
+            let mut my_games = 0u64;
             let mut s = Searcher::new(8, Arc::new(AtomicBool::new(false)));
             s.silent = true;
             let lim = Limits { soft_ms: None, hard_ms: None, depth: 64, nodes: Some(nodes) };
@@ -174,8 +187,9 @@ pub fn run(threads: usize, prefix: &str, nodes: u64, seconds: u64) {
                     f.write_all(&pack(p, *ws, result)).unwrap();
                 }
                 total_pos.fetch_add(recs.len() as u64, Ordering::Relaxed);
-                let g = total_games.fetch_add(1, Ordering::Relaxed) + 1;
-                if t == 0 && g % 200 < 1 {
+                total_games.fetch_add(1, Ordering::Relaxed);
+                my_games += 1;
+                if my_games % 200 == 0 {
                     let _ = f.flush();
                 }
                 if t == 0 && rng.next() % 50 == 0 {

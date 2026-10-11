@@ -336,8 +336,14 @@ fn main() {
                 return;
             }
             "datagen" => {
-                // datagen <threads> <prefix> <nodes> <seconds>
-                datagen::run(args[2].parse().unwrap(), &args[3], args[4].parse().unwrap(), args[5].parse().unwrap());
+                // datagen <threads> <prefix> <nodes> <seconds> [seed]
+                let num = |i: usize| args.get(i).and_then(|s| s.parse::<u64>().ok());
+                let (Some(threads), Some(prefix), Some(nodes), Some(seconds)) = (num(2), args.get(3), num(4), num(5))
+                else {
+                    eprintln!("usage: incipit datagen <threads> <prefix> <nodes> <seconds> [seed]");
+                    std::process::exit(2);
+                };
+                datagen::run(threads as usize, prefix, nodes, seconds, num(6).unwrap_or(0));
                 return;
             }
             "l1perm" if args.len() >= 5 => {
