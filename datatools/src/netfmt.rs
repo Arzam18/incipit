@@ -1,10 +1,13 @@
 // Incipit network format (docs/net-format.md): writer and reader.
 //
-// `convert` builds a network file from quantised weights in one of two source
-// layouts, both [l0w][l0b][l1w][l1b] with l0w as [bucket][feature][hidden] and
-// l1w as [output bucket][2 * hidden]:
+// `convert` builds a network file from quantised weights. Without a hidden
+// layer the source is one of two layouts, both [l0w][l0b][l1w][l1b] with l0w
+// as [bucket][feature][hidden] and l1w as [output bucket][2 * hidden]:
 //   * bullet: Bullet's quantised.bin (l1b as i16, padded to 64 bytes);
 //   * raw:    the engine's previous headerless format (l1b as i32).
+// With a hidden layer (`Arch::l1`, Bullet source only) see `convert_hidden`:
+// the int8 hidden layer, an optional f32 second layer (dual or skip head)
+// and an optional pre-activation readout, written by `write_hidden`.
 use std::fmt::Write as _;
 
 pub const MAGIC: &[u8; 8] = b"INCPTNET";

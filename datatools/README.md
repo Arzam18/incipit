@@ -11,7 +11,7 @@ datatools net <bullet|raw> <in> <out_dir> --hidden N [options]   # network -> In
 datatools net-info <file.nnue> ...          # show a network's header
 ```
 
-`datatools net` reads Bullet's `quantised.bin` (`bullet`) or the engine's old headerless nets (`raw`) and writes `<out_dir>/net-XXXXXXXX.nnue`, named by its SHA-256 as usual. Options: `--king-buckets` (32 or 64 comma-separated entries), `--mirror`, `--output-buckets N` (default 8), `--activation screlu|crelu`, `--qa`/`--qb`/`--scale` (default 255/64/400), and `--description` to record the training run.
+`datatools net` reads Bullet's `quantised.bin` (`bullet`) or the engine's old headerless nets (`raw`) and writes `<out_dir>/net-XXXXXXXX.nnue`, named by its SHA-256 as usual. Options: `--king-buckets` (32 or 64 comma-separated entries), `--mirror`, `--output-buckets N` (default 8), `--activation screlu|crelu|pairwise`, `--qa`/`--qb`/`--scale` (default 255/64/400; with `--l1`, QB is the hidden layer's int8 weight scale and defaults to 128, the only scale the trainer saves), and `--description` to record the training run. Hidden-layer nets (Bullet source only): `--l1 N` (8 or 16 neurons), `--l1-shared`, `--l2 N` (a second, f32 layer), `--l1-dual` (the second layer takes SCReLU and CReLU of the first; needs `--l2`), `--l1-skip` (last neuron linear to the output; needs `--l2`), `--l1-lin N` (pre-activation readout of the first N neurons), `--l1-shift S` (input shift, default the smallest that fits 0..127), `--permute FILE` (feature-transformer neuron order from the engine's `l1perm`). See `docs/net-format.md` in the engine repo for the layouts.
 
 OpenBench PGN archives hold bzip2-compressed shards, so pipe them in:
 `tar xf 1234.pgn.tar && bzcat *.pgn.bz2 | datatools pgn 1234.vf -`

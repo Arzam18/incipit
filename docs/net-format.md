@@ -118,7 +118,10 @@ settings that produced the network.
 Codes used above:
 
 * **Activations**: `0` none, `1` ReLU, `2` CReLU (clamp to [0, QA]), `3` SCReLU
-  (clamp to [0, QA], then square).
+  (clamp to [0, QA], then square), `4` pairwise (feature transformer only:
+  output `i` of a perspective is `clamp(a[i]) · clamp(a[i + H/2])`, so each
+  perspective feeds H/2 values to the next layer, and H must be a multiple
+  of 128).
 * **Types**: `1` i8, `2` i16, `3` i32, `4` f32.
 
 ## Weights
@@ -158,7 +161,8 @@ layer's input:
 The output bias is at scale `QA · QB`.
 
 With one hidden layer (two LAYERs: `2H -> N`, SCReLU, i8 weights, f32 biases;
-then `N -> 1`, f32; both per output bucket; the engine supports N = 16):
+then `N -> 1`, f32; both per output bucket; the engine supports N = 8 and 16,
+and `H -> N` with the pairwise activation):
 
 * `x = clamp(a, 0, QA)² >> shift` as u8, side to move's accumulator first;
 * `z[n] = Σ x · w1[bucket][n]` (integer), then
@@ -169,3 +173,13 @@ then `N -> 1`, f32; both per output bucket; the engine supports N = 16):
 Weights for these layers are stored `[bucket][output][input]` as in the
 general rule: i8 for the hidden layer, then its f32 biases, the final layer's
 f32 weights `[bucket][N]` and its f32 biases `[bucket]`.
+
+With a second hidden layer (three LAYERs): the middle one is `M -> L2`, SCReLU,
+f32 weights and biases, per output bucket, where `M` is `N`, or `2N` when it
+takes both the SCReLU and the CReLU of the first layer's outputs (the "dual"
+head: the trainer's `l2relu`; the converter's `--l1-dual`), or `N - 1` with the
+linear skip above; the final layer is then `L2 -> 1`. Its blocks follow the
+first hidden layer's biases: f32 weights `[bucket][L2][M]`, f32 biases
+`[bucket][L2]`, then the final layer's `[bucket][L2]` weights and `[bucket]`
+biases, then the readout block if any. LAYER_QUANT carries an all-zero entry
+for each f32 layer.
