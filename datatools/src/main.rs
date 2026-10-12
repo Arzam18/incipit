@@ -209,18 +209,39 @@ fn cmd_bin(out_dir: &str, inputs: &[String]) -> Result<(), String> {
     }
 }
 
+/// <out_dir>/<file name> for each input, refusing two inputs with the same
+/// file name (one would silently overwrite the other) and an output that is
+/// its own input.
+fn output_paths(out_dir: &str, inputs: &[String]) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let name = Path::new(input).file_name().ok_or_else(|| format!("{}: no file name", input))?;
+        if !seen.insert(name.to_os_string()) {
+            return Err(format!("two inputs are named {}: their outputs would collide", name.to_string_lossy()));
+        }
+        let dest = Path::new(out_dir).join(name);
+        if let (Ok(a), Ok(b)) = (std::fs::canonicalize(input), std::fs::canonicalize(&dest)) {
+            if a == b {
+                return Err(format!("{}: the output would overwrite the input", input));
+            }
+        }
+        out.push(dest);
+    }
+    Ok(out)
+}
+
 fn cmd_rescale(factor: &str, out_dir: &str, inputs: &[String]) -> Result<(), String> {
     let factor: f64 = factor.parse().map_err(|_| format!("bad factor {}", factor))?;
     if !(factor > 0.0 && factor.is_finite()) {
         return Err(format!("factor must be positive, got {}", factor));
     }
+    let dests = output_paths(out_dir, inputs)?;
     std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {}", out_dir, e))?;
-    for input in inputs {
+    for (input, dest) in inputs.iter().zip(&dests) {
         let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
         let out = viri::rescale(&data, factor).map_err(|e| format!("{}: {}", input, e))?;
-        let name = std::path::Path::new(input).file_name().ok_or_else(|| format!("{}: no file name", input))?;
-        let dest = std::path::Path::new(out_dir).join(name);
-        std::fs::write(&dest, out).map_err(|e| format!("{}: {}", dest.display(), e))?;
+        std::fs::write(dest, out).map_err(|e| format!("{}: {}", dest.display(), e))?;
     }
     println!("rescaled {} files by {} into {}", inputs.len(), factor, out_dir);
     Ok(())
@@ -244,6 +265,16 @@ fn cmd_calibrate(a: &str, b: &str, out_dir: &str, inputs: &[String]) -> Result<(
     };
     let (ca, cb) = (coef(a)?, coef(b)?);
     let poly = |c: &[f64; 4], m: f64| ((c[0] * m + c[1]) * m + c[2]) * m + c[3];
+    // Reject a model that isn't finite over the material range (NaN would
+    // otherwise turn every label into 0 without an error).
+    if ca.iter().chain(&cb).any(|c| !c.is_finite())
+        || (17..=78).any(|mat| {
+            let m = mat as f64 / 58.0;
+            !poly(&ca, m).is_finite() || !poly(&cb, m).is_finite()
+        })
+    {
+        return Err("calibrate: the coefficients must be finite (and give finite a, b for material 17..78)".into());
+    }
     let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
     let map = |pos: &position::Position, s: i16| -> i16 {
         if s == viri::NO_SCORE {
@@ -260,6 +291,7 @@ fn cmd_calibrate(a: &str, b: &str, out_dir: &str, inputs: &[String]) -> Result<(
             -y
         }
     };
+    let dests = output_paths(out_dir, inputs)?;
     std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {}", out_dir, e))?;
     let next = AtomicUsize::new(0);
     let errors = Mutex::new(Vec::new());
@@ -269,12 +301,11 @@ fn cmd_calibrate(a: &str, b: &str, out_dir: &str, inputs: &[String]) -> Result<(
             s.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(input) = inputs.get(i) else { break };
+                let dest = &dests[i];
                 let run = || -> Result<(), String> {
                     let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
                     let out = viri::map_scores(&data, map).map_err(|e| format!("{}: {}", input, e))?;
-                    let name = Path::new(input).file_name().ok_or_else(|| format!("{}: no file name", input))?;
-                    let dest = Path::new(out_dir).join(name);
-                    std::fs::write(&dest, out).map_err(|e| format!("{}: {}", dest.display(), e))
+                    std::fs::write(dest, out).map_err(|e| format!("{}: {}", dest.display(), e))
                 };
                 if let Err(e) = run() {
                     errors.lock().unwrap().push(e);
