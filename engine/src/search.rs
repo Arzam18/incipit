@@ -332,6 +332,9 @@ pub struct Searcher {
     refresh_cache: nnue::RefreshCache,
     /// Pondering and time-decision state.
     pub pt: Box<PonderTm>,
+    /// The score of root_best's search (set with it), returned with it when a
+    /// search stops mid-iteration.
+    root_best_score: i32,
 }
 
 #[inline(always)]
@@ -493,6 +496,7 @@ impl Searcher {
             tb_hits: 0,
             root_depth: 0,
             root_best: 0,
+            root_best_score: 0,
             no_nmp_ply: usize::MAX,
             search_moves: Vec::new(),
             lmr,
@@ -672,6 +676,7 @@ impl Searcher {
         // to; otherwise a hard stop would revert to the main thread's own move
         // while the PV just reported names the adopted one.
         self.root_best = win;
+        self.root_best_score = c.score;
     }
 
     /// Nodes searched by all threads (helpers' counts lag by up to 1024 nodes each).
@@ -839,6 +844,7 @@ impl Searcher {
         self.hard_ms = lim.hard_ms;
         self.node_limit = lim.nodes;
         self.root_best = 0;
+        self.root_best_score = 0;
         self.pt.last_pv2 = (0, 0);
         self.seldepth = 0;
         self.acc[0].refresh(root);
@@ -964,13 +970,14 @@ impl Searcher {
                 } else {
                     "hard"
                 };
+                // Return the score that goes with the move: the score of its
+                // own search, not the last completed depth's (which may belong
+                // to another move); a stopped aspiration fail-high's move
+                // carries its lower bound, as the info line below reports.
                 if self.root_best != 0 {
                     best = self.root_best;
+                    score = self.root_best_score;
                 }
-                // Return the score that goes with the move: a stopped
-                // aspiration fail-high's move carries its lower bound (as the
-                // info line below reports), not the last completed depth's
-                // score.
                 if best == fh_move && fh_move != 0 {
                     score = fh_score;
                 }
@@ -1655,6 +1662,7 @@ impl Searcher {
                     self.pv_len[ply] = cl + 1;
                     if root {
                         self.root_best = m;
+                        self.root_best_score = score;
                     }
                     if alpha >= beta {
                         let k = legal as u64;
