@@ -17,3 +17,6 @@ data/
 /engine/incipit
 /engine/incipit.exe
 *.tmp
+
+# fastchess writes its settings here when run from the repo
+config.json
