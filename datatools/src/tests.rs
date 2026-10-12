@@ -357,3 +357,29 @@ fn viri_readers_reject_trailing_bytes() {
     assert!(viri::for_each_game(&buf, |_, _| {}).is_err());
     assert!(viri::for_each_position(&buf, |_, _, _, _| {}).is_err());
 }
+
+#[test]
+fn rescale_scales_scores_only() {
+    crate::attacks::init();
+    let start = Position::from_fen(START_FEN).unwrap();
+    let mut pos = start;
+    let mut moves = Vec::new();
+    for (k, s) in [100i16, -37, viri::NO_SCORE, 0, 21000].into_iter().enumerate() {
+        let m = legal(&pos)[k];
+        moves.push((m, s));
+        pos.make_move(m);
+    }
+    let game = Game { start, wdl: viri::WDL_DRAW, moves };
+    let mut bytes = Vec::new();
+    game.write(&mut bytes).unwrap();
+    let out = viri::rescale(&bytes, 1.5).unwrap();
+    let mut got = Vec::new();
+    viri::for_each_position(&out, |_, m, s, w| got.push((m, s, w))).unwrap();
+    let want: Vec<_> = [150i16, -56, viri::NO_SCORE, 0, 30000]
+        .iter()
+        .zip(&game.moves)
+        .map(|(&s, &(m, _))| (m, s, viri::WDL_DRAW))
+        .collect();
+    assert_eq!(got, want);
+    assert!(viri::rescale(&bytes[..bytes.len() - 2], 1.5).is_err());
+}

@@ -38,6 +38,9 @@ usage:
   datatools wdlstats <out.csv> <in.vf> ...    win/draw/loss counts by (material, eval), side to move,
                                               for fitting a WDL model (from ply 16, not in check, scored)
   datatools wdlfit <stats.csv>                 fit the WDL model to wdlstats output (maximum likelihood)
+  datatools rescale <factor> <out_dir> <in.vf> ...
+                                              multiply every score by <factor> (unscored positions
+                                              unchanged), writing <out_dir>/<same name> per input
   datatools matstats <out.csv> <in.vf> ...    stored score and result by material lead, side to move,
                                               to check labels in decided positions (quiet moves only)
   datatools net <source> <in> <out_dir> [options]
@@ -77,6 +80,7 @@ fn main() {
         Some("piecestats") if args.len() >= 3 => cmd_piecestats(&args[2..]),
         Some("matstats") if args.len() >= 4 => cmd_matstats(&args[2], &args[3..]),
         Some("wdlfit") if args.len() >= 3 => cmd_wdlfit(&args[2]),
+        Some("rescale") if args.len() >= 5 => cmd_rescale(&args[2], &args[3], &args[4..]),
         Some("net") if args.len() >= 5 => cmd_net(&args[2], &args[3], &args[4], &args[5..]),
         Some("net-info") if args.len() >= 3 => cmd_net_info(&args[2..]),
         Some("fens") if args.len() >= 5 => cmd_fens(&args[2], &args[3], &args[4..]),
@@ -197,6 +201,23 @@ fn cmd_bin(out_dir: &str, inputs: &[String]) -> Result<(), String> {
     } else {
         Err(errors.join("\n"))
     }
+}
+
+fn cmd_rescale(factor: &str, out_dir: &str, inputs: &[String]) -> Result<(), String> {
+    let factor: f64 = factor.parse().map_err(|_| format!("bad factor {}", factor))?;
+    if !(factor > 0.0 && factor.is_finite()) {
+        return Err(format!("factor must be positive, got {}", factor));
+    }
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {}", out_dir, e))?;
+    for input in inputs {
+        let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
+        let out = viri::rescale(&data, factor).map_err(|e| format!("{}: {}", input, e))?;
+        let name = std::path::Path::new(input).file_name().ok_or_else(|| format!("{}: no file name", input))?;
+        let dest = std::path::Path::new(out_dir).join(name);
+        std::fs::write(&dest, out).map_err(|e| format!("{}: {}", dest.display(), e))?;
+    }
+    println!("rescaled {} files by {} into {}", inputs.len(), factor, out_dir);
+    Ok(())
 }
 
 fn cmd_stats(inputs: &[String]) -> Result<(), String> {

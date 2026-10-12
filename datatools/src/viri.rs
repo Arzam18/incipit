@@ -113,6 +113,38 @@ pub fn count(data: &[u8]) -> Result<(u64, u64, u64), String> {
     Ok((games, moves, unscored))
 }
 
+/// Multiplies every score in a viriformat byte stream by `factor` (rounded,
+/// kept within +-MAX_RESCALED), leaving unscored positions (NO_SCORE), boards,
+/// moves and results as they are. Used to put each data set's labels on one
+/// eval scale (label calibration).
+pub fn rescale(data: &[u8], factor: f64) -> Result<Vec<u8>, String> {
+    const MAX_RESCALED: f64 = 30000.0;
+    let mut out = data.to_vec();
+    let mut i = 0;
+    while i < out.len() {
+        if i + 32 > out.len() {
+            return Err(format!("truncated board at byte {}", i));
+        }
+        i += 32;
+        loop {
+            if i + 4 > out.len() {
+                return Err(format!("unterminated game at byte {}", i));
+            }
+            if out[i..i + 4] == [0; 4] {
+                i += 4;
+                break;
+            }
+            let s = i16::from_le_bytes([out[i + 2], out[i + 3]]);
+            if s != NO_SCORE {
+                let r = (s as f64 * factor).round().clamp(-MAX_RESCALED, MAX_RESCALED) as i16;
+                out[i + 2..i + 4].copy_from_slice(&r.to_le_bytes());
+            }
+            i += 4;
+        }
+    }
+    Ok(out)
+}
+
 /// Rebuilds a Position from a packed board (the inverse of pack_board).
 /// Returns None if the board isn't valid.
 pub fn unpack_board(b: &[u8]) -> Option<(Position, i16, u8)> {
