@@ -136,8 +136,11 @@ jobs:
           path: dist/
 
   check-macos-intel:
+    # No Intel macOS runners any more: the x86-64 half runs under Rosetta
+    # (macOS 15's supports AVX2), which checks the slice is valid and
+    # complete, not its speed.
     needs: macos
-    runs-on: macos-13
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -149,6 +152,7 @@ jobs:
       - name: Bench the x86-64 half
         run: |
           chmod +x dist/*-macos-universal
+          softwareupdate --install-rosetta --agree-to-license > /dev/null 2>&1 || true
           want=$(git log -50 --format=%B | sed -n 's/^Bench: \([0-9]*\)$/\1/p' | head -1)
           out=$(arch -x86_64 dist/*-macos-universal bench | tail -2)
           echo "$out" | head -1
