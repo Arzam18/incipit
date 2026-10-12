@@ -1,0 +1,112 @@
+# Release builds: Linux and Windows (cross-compiled with MinGW) for three
+# x86-64 levels, smoke-tested on both systems, then attached to a draft
+# GitHub release when a v* tag is pushed. Run it by hand (Actions tab ->
+# release -> Run workflow) to get the binaries as artifacts without a release.
+#
+# Until the binary dispatches on the CPU at run time, each level is its own
+# build:
+#   v3         x86-64-v3 (AVX2, BMI2/PEXT): modern Intel, AMD Zen 3 and later
+#   v3-nopext  x86-64-v3 without BMI2 (PEXT is slow on AMD Zen 1 and Zen 2)
+#   v4         x86-64-v4 (AVX-512)
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Net
+        working-directory: engine
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: make net
+
+      - name: Build
+        working-directory: engine
+        run: |
+          net="$PWD/$(basename "$(cat net.txt)")"
+          ver=$(git describe --tags --always)
+          mkdir -p ../dist
+          for level in v3 v3-nopext v4; do
+            case $level in
+              v3)        cpu="-Ctarget-cpu=x86-64-v3" ;;
+              v3-nopext) cpu="-Ctarget-cpu=x86-64-v3 -Ctarget-feature=-bmi2" ;;
+              v4)        cpu="-Ctarget-cpu=x86-64-v4" ;;
+            esac
+            for target in x86_64-unknown-linux-gnu x86_64-pc-windows-gnu; do
+              if [ $target = x86_64-pc-windows-gnu ]; then cc=x86_64-w64-mingw32-gcc; os=windows; ext=.exe
+              else cc=cc; os=linux; ext=; fi
+              CC=$cc EVALFILE="$net" RUSTFLAGS="$cpu -Ctarget-feature=+crt-static" \
+                cargo build --release --target $target
+              cp target/$target/release/incipit$ext ../dist/incipit-$ver-$os-x86-64-$level$ext
+            done
+          done
+          ls -l ../dist
+
+      - name: Check Linux builds
+        run: |
+          want=$(git log -50 --format=%B | sed -n 's/^Bench: \([0-9]*\)$/\1/p' | head -1)
+          for f in dist/*-linux-x86-64-v3 dist/*-linux-x86-64-v3-nopext; do
+            got=$("$f" bench | tail -1 | cut -d' ' -f1)
+            echo "$f: bench $got (want $want)"
+            [ "$got" = "$want" ]
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: incipit
+          path: dist/
+
+  check-windows:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+      - uses: actions/download-artifact@v4
+        with:
+          name: incipit
+          path: dist
+      - name: Bench the Windows builds
+        shell: bash
+        run: |
+          want=$(git log -50 --format=%B | sed -n 's/^Bench: \([0-9]*\)$/\1/p' | head -1)
+          for f in dist/*-windows-x86-64-v3.exe dist/*-windows-x86-64-v3-nopext.exe; do
+            got=$("$f" bench | tail -1 | cut -d' ' -f1)
+            echo "$f: bench $got (want $want)"
+            [ "$got" = "$want" ]
+          done
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, check-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: incipit
+          path: dist
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" \
+            --draft --title "Incipit ${{ github.ref_name }}" --generate-notes
