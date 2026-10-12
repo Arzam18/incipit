@@ -101,8 +101,8 @@ fn build_fathom(dir: &std::path::Path) {
     let cc = env::var("CC").unwrap_or_else(|_| "cc".into());
     let mut cmd = process::Command::new(&cc);
     // No stack protector: distributions often enable it by default, and on
-    // aarch64 Linux its guard symbol lives in the dynamic loader, which
-    // rustc's link line doesn't name for an object passed as a link argument.
+    // aarch64 Linux its guard symbol lives in the dynamic loader, which a
+    // static build doesn't have.
     cmd.args(["-std=gnu99", "-O2", "-fPIC", "-fno-stack-protector", "-w", "-c"]);
     // Apple's clang builds for the host by default; name the target's
     // architecture so an x86-64 build on an arm64 Mac (or the reverse) gets
@@ -114,16 +114,30 @@ fn build_fathom(dir: &std::path::Path) {
     let status = cmd.arg("-I").arg(&src).arg(src.join("tbprobe.c")).arg("-o").arg(&out).status();
     match status {
         Ok(s) if s.success() => {
-            println!("cargo:rustc-link-arg={}", out.display());
-            // rustc puts link args after the system libraries, and GNU ld only
-            // resolves symbols against libraries that come later, so on MinGW
-            // repeat the runtime libraries Fathom needs after fathom.o.
-            let target = env::var("TARGET").unwrap_or_default();
-            if target.ends_with("windows-gnu") {
-                for lib in ["-lmingwex", "-lmsvcrt", "-lgcc", "-lkernel32"] {
-                    println!("cargo:rustc-link-arg={lib}");
+            // Linked as a static library, not a raw link argument: rustc puts
+            // link arguments after the system libraries, and GNU ld only
+            // resolves an object's references (libc, MinGW's runtime) against
+            // libraries that come later, which broke MinGW and static aarch64
+            // builds. A library rustc knows about goes before them.
+            let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+            let lib = out_dir.join("libfathom.a");
+            let _ = std::fs::remove_file(&lib);
+            // The archiver that matches the C compiler: x86_64-w64-mingw32-gcc
+            // -> x86_64-w64-mingw32-ar, otherwise ar (AR overrides).
+            println!("cargo:rerun-if-env-changed=AR");
+            let ar = env::var("AR").unwrap_or_else(|_| match cc.strip_suffix("gcc") {
+                Some(prefix) if prefix.ends_with('-') => format!("{prefix}ar"),
+                _ => "ar".into(),
+            });
+            match process::Command::new(&ar).arg("crs").arg(&lib).arg(&out).status() {
+                Ok(s) if s.success() => {}
+                _ => {
+                    eprintln!("error: archiving Fathom with `{}` failed (set AR to an archiver)", ar);
+                    process::exit(1);
                 }
             }
+            println!("cargo:rustc-link-search=native={}", out_dir.display());
+            println!("cargo:rustc-link-lib=static=fathom");
         }
         _ => {
             eprintln!("error: compiling the Fathom tablebase prober with `{}` failed (set CC to a C compiler)", cc);
