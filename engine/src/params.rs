@@ -77,9 +77,11 @@ params! {
     // + thinking reaches it (PonderCredit% of the pondering time counts).
     PonderHitPct = "PonderHitPct", 80, 30, 1000, 8;
     PonderCredit = "PonderCredit", 100, 30, 100, 10;
-    // Least thinking after a hit, % of the soft limit (0: none; the
-    // PonderHitPct rule already prevents instant replies to short ponders).
-    PonderMinPct = "PonderMinPct", 0, 0, 100, 5;
+    // Least thinking after a hit, % of the soft limit. With 0, a ponder that
+    // covered the target ended in an instant move (24-39% of moves in local
+    // ponder gauntlets, 38-49% on lichess) and the clock went unused; 30 keeps
+    // instant moves at 2-4%, like other engines that ponder.
+    PonderMinPct = "PonderMinPct", 30, 0, 100, 5;
     TmFinishPct = "TmFinishPct", 100, 50, 150, 10;
     TmFailLow = "TmFailLow", 30, 0, 100, 8;
     TmFeedMax = "TmFeedMax", 250, 100, 400, 20;
