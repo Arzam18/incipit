@@ -100,7 +100,10 @@ fn build_fathom(dir: &std::path::Path) {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("fathom.o");
     let cc = env::var("CC").unwrap_or_else(|_| "cc".into());
     let mut cmd = process::Command::new(&cc);
-    cmd.args(["-std=gnu99", "-O2", "-fPIC", "-w", "-c"]);
+    // No stack protector: distributions often enable it by default, and on
+    // aarch64 Linux its guard symbol lives in the dynamic loader, which
+    // rustc's link line doesn't name for an object passed as a link argument.
+    cmd.args(["-std=gnu99", "-O2", "-fPIC", "-fno-stack-protector", "-w", "-c"]);
     // Apple's clang builds for the host by default; name the target's
     // architecture so an x86-64 build on an arm64 Mac (or the reverse) gets
     // an object the linker accepts.
