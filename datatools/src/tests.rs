@@ -383,3 +383,25 @@ fn rescale_scales_scores_only() {
     assert_eq!(got, want);
     assert!(viri::rescale(&bytes[..bytes.len() - 2], 1.5).is_err());
 }
+
+#[test]
+fn map_scores_sees_positions() {
+    crate::attacks::init();
+    let start = Position::from_fen(START_FEN).unwrap();
+    let mut pos = start;
+    let mut moves = Vec::new();
+    for (k, s) in [100i16, -37, viri::NO_SCORE, 0].into_iter().enumerate() {
+        let m = legal(&pos)[k];
+        moves.push((m, s));
+        pos.make_move(m);
+    }
+    let game = Game { start, wdl: viri::WDL_DRAW, moves };
+    let mut bytes = Vec::new();
+    game.write(&mut bytes).unwrap();
+    // Score = side to move's index (0 white, 1 black) * 1000 + the old score's sign.
+    let out = viri::map_scores(&bytes, |p, s| if s == viri::NO_SCORE { s } else { p.stm as i16 * 1000 + s.signum() })
+        .unwrap();
+    let mut got = Vec::new();
+    viri::for_each_position(&out, |_, _, s, _| got.push(s)).unwrap();
+    assert_eq!(got, vec![1, 999, viri::NO_SCORE, 1000]);
+}

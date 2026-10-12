@@ -41,6 +41,11 @@ usage:
   datatools rescale <factor> <out_dir> <in.vf> ...
                                               multiply every score by <factor> (unscored positions
                                               unchanged), writing <out_dir>/<same name> per input
+  datatools calibrate <a0,a1,a2,a3> <b0,b1,b2,b3> <out_dir> <in.vf> ...
+                                              replace each score x by 400 logit(E(x)), E the expected
+                                              score under the set's WDL model (wdlfit's a and b), so
+                                              sigmoid(score / 400) is the label's calibrated
+                                              probability; unscored positions unchanged
   datatools matstats <out.csv> <in.vf> ...    stored score and result by material lead, side to move,
                                               to check labels in decided positions (quiet moves only)
   datatools net <source> <in> <out_dir> [options]
@@ -81,6 +86,7 @@ fn main() {
         Some("matstats") if args.len() >= 4 => cmd_matstats(&args[2], &args[3..]),
         Some("wdlfit") if args.len() >= 3 => cmd_wdlfit(&args[2]),
         Some("rescale") if args.len() >= 5 => cmd_rescale(&args[2], &args[3], &args[4..]),
+        Some("calibrate") if args.len() >= 6 => cmd_calibrate(&args[2], &args[3], &args[4], &args[5..]),
         Some("net") if args.len() >= 5 => cmd_net(&args[2], &args[3], &args[4], &args[5..]),
         Some("net-info") if args.len() >= 3 => cmd_net_info(&args[2..]),
         Some("fens") if args.len() >= 5 => cmd_fens(&args[2], &args[3], &args[4..]),
@@ -217,6 +223,70 @@ fn cmd_rescale(factor: &str, out_dir: &str, inputs: &[String]) -> Result<(), Str
         std::fs::write(&dest, out).map_err(|e| format!("{}: {}", dest.display(), e))?;
     }
     println!("rescaled {} files by {} into {}", inputs.len(), factor, out_dir);
+    Ok(())
+}
+
+/// Label calibration against outcomes (cal2): each scored position's label x
+/// (side to move) becomes 400 * logit(E), where E = (1 + P(win) - P(loss)) / 2
+/// under the set's own WDL model (wdlfit: P(win) = sigmoid((x - a) / b),
+/// P(loss) = sigmoid((-x - a) / b), a and b cubic in material / 58). The
+/// trainer's target sigmoid(score / 400) is then the label's probability of
+/// the outcome as the set's own games measured it, whatever eval scale the
+/// labelling net had.
+fn cmd_calibrate(a: &str, b: &str, out_dir: &str, inputs: &[String]) -> Result<(), String> {
+    let coef = |s: &str| -> Result<[f64; 4], String> {
+        let v: Vec<f64> = s
+            .split(',')
+            .map(|x| x.trim().parse::<f64>())
+            .collect::<Result<_, _>>()
+            .map_err(|_| format!("bad coefficients {}", s))?;
+        v.try_into().map_err(|_| format!("need 4 coefficients, got {}", s))
+    };
+    let (ca, cb) = (coef(a)?, coef(b)?);
+    let poly = |c: &[f64; 4], m: f64| ((c[0] * m + c[1]) * m + c[2]) * m + c[3];
+    let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
+    let map = |pos: &position::Position, s: i16| -> i16 {
+        if s == viri::NO_SCORE {
+            return s;
+        }
+        let m = (material(pos) as f64).clamp(17.0, 78.0) / 58.0;
+        let (am, bm) = (poly(&ca, m), poly(&cb, m).max(1.0));
+        let x = if pos.stm == position::WHITE { s as f64 } else { -(s as f64) };
+        let e = (0.5 + 0.5 * (sig((x - am) / bm) - sig((-x - am) / bm))).clamp(1e-4, 1.0 - 1e-4);
+        let y = (400.0 * (e / (1.0 - e)).ln()).round() as i16;
+        if pos.stm == position::WHITE {
+            y
+        } else {
+            -y
+        }
+    };
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {}", out_dir, e))?;
+    let next = AtomicUsize::new(0);
+    let errors = Mutex::new(Vec::new());
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(inputs.len());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(input) = inputs.get(i) else { break };
+                let run = || -> Result<(), String> {
+                    let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
+                    let out = viri::map_scores(&data, map).map_err(|e| format!("{}: {}", input, e))?;
+                    let name = Path::new(input).file_name().ok_or_else(|| format!("{}: no file name", input))?;
+                    let dest = Path::new(out_dir).join(name);
+                    std::fs::write(&dest, out).map_err(|e| format!("{}: {}", dest.display(), e))
+                };
+                if let Err(e) = run() {
+                    errors.lock().unwrap().push(e);
+                }
+            });
+        }
+    });
+    let errors = errors.into_inner().unwrap();
+    if let Some(e) = errors.first() {
+        return Err(format!("{} files failed, first: {}", errors.len(), e));
+    }
+    println!("calibrated {} files into {}", inputs.len(), out_dir);
     Ok(())
 }
 

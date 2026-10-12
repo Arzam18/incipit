@@ -145,6 +145,48 @@ pub fn rescale(data: &[u8], factor: f64) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Rewrites every score in a viriformat byte stream with `f(position, score)`
+/// (white-relative, as stored; unscored positions are passed as NO_SCORE),
+/// leaving boards, moves and results unchanged. Positions are replayed, so
+/// `f` can use material and the side to move.
+pub fn map_scores(data: &[u8], mut f: impl FnMut(&Position, i16) -> i16) -> Result<Vec<u8>, String> {
+    let mut out = data.to_vec();
+    let mut i = 0;
+    while i < out.len() {
+        if i + 32 > out.len() {
+            return Err(format!("truncated board at byte {}", i));
+        }
+        let (mut pos, _, _) = unpack_board(&out[i..i + 32]).ok_or_else(|| format!("bad board at byte {}", i))?;
+        i += 32;
+        loop {
+            if i + 4 > out.len() {
+                return Err(format!("unterminated game at byte {}", i));
+            }
+            let raw = u16::from_le_bytes([out[i], out[i + 1]]);
+            let score = i16::from_le_bytes([out[i + 2], out[i + 3]]);
+            if raw == 0 && score == 0 {
+                i += 4;
+                break;
+            }
+            let mut list = MoveList::new();
+            pos.gen_moves(&mut list, false);
+            let m = (0..list.len())
+                .map(|k| list[k])
+                .find(|&m| {
+                    encode_move(&pos, m) == raw && {
+                        let mut c = pos;
+                        c.make_move(m)
+                    }
+                })
+                .ok_or_else(|| format!("illegal move {:04x} in {}", raw, pos.to_fen()))?;
+            out[i + 2..i + 4].copy_from_slice(&f(&pos, score).to_le_bytes());
+            pos.make_move(m);
+            i += 4;
+        }
+    }
+    Ok(out)
+}
+
 /// Rebuilds a Position from a packed board (the inverse of pack_board).
 /// Returns None if the board isn't valid.
 pub fn unpack_board(b: &[u8]) -> Option<(Position, i16, u8)> {
