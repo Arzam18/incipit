@@ -1,10 +1,11 @@
 // Attack tables: leapers, table-indexed sliders, zobrist keys.
 //
 // Sliders share one table holding a block of 2^bits entries per square, where
-// bits is the number of squares in the square's occupancy mask. With BMI2 the
-// block is indexed by PEXT of the occupancy; elsewhere (e.g. arm64) by a magic
-// multiply. The order within a block differs between the two, but the attack
-// sets are the same.
+// bits is the number of squares in the square's occupancy mask. Where PEXT is
+// fast the block is indexed by PEXT of the occupancy; elsewhere (AMD Zen 1/2,
+// where PEXT is microcoded, and arm64) by a magic multiply. The order within a
+// block differs between the two, so the table is filled for the scheme chosen
+// at start-up; the attack sets are the same.
 #[cfg(target_feature = "bmi2")]
 use std::arch::x86_64::_pext_u64;
 use std::ptr::{addr_of, addr_of_mut};
@@ -18,7 +19,9 @@ static mut R_MASK: [u64; 64] = [0; 64];
 static mut B_MASK: [u64; 64] = [0; 64];
 static mut R_OFF: [usize; 64] = [0; 64];
 static mut B_OFF: [usize; 64] = [0; 64];
-// Shifts (64 - bits) for the magic index; unused with BMI2.
+/// Slider tables indexed by PEXT (set once by init, before any lookup).
+static mut USE_PEXT: bool = false;
+// Shifts (64 - bits) for the magic index; unused with PEXT.
 static mut R_SHIFT: [u8; 64] = [0; 64];
 static mut B_SHIFT: [u8; 64] = [0; 64];
 static mut SLIDE: [u64; 107648] = [0; 107648];
@@ -217,16 +220,45 @@ const B_MAGIC: [u64; 64] = [
 ];
 
 /// Index of occupancy `occ` within a square's block of the slider table.
-#[cfg(target_feature = "bmi2")]
-#[inline(always)]
-fn index(occ: u64, mask: u64, _magic: u64, _shift: u8) -> usize {
-    unsafe { _pext_u64(occ, mask) as usize }
-}
-
-#[cfg(not(target_feature = "bmi2"))]
 #[inline(always)]
 fn index(occ: u64, mask: u64, magic: u64, shift: u8) -> usize {
+    #[cfg(target_feature = "bmi2")]
+    if unsafe { USE_PEXT } {
+        return unsafe { _pext_u64(occ, mask) as usize };
+    }
     ((occ & mask).wrapping_mul(magic) >> shift) as usize
+}
+
+/// Whether to index the slider tables with PEXT: BMI2 is there and PEXT is
+/// fast, i.e. not an AMD Zen 1/2 (family 17h), where it is microcoded and
+/// slower than a magic multiply. INCIPIT_PEXT=0 or 1 overrides the choice
+/// (for testing both paths on one machine).
+pub fn pext_wanted() -> bool {
+    #[cfg(target_feature = "bmi2")]
+    {
+        if let Ok(v) = std::env::var("INCIPIT_PEXT") {
+            return v != "0";
+        }
+        use std::arch::x86_64::__cpuid;
+        #[allow(unused_unsafe)]
+        let v = unsafe { __cpuid(0) };
+        let amd = (v.ebx, v.edx, v.ecx) == (0x6874_7541, 0x6974_6e65, 0x444d_4163);
+        #[allow(unused_unsafe)]
+        let f = unsafe { __cpuid(1) }.eax;
+        let family = ((f >> 8) & 0xf) + if (f >> 8) & 0xf == 0xf { (f >> 20) & 0xff } else { 0 };
+        !(amd && family < 0x19)
+    }
+    #[cfg(not(target_feature = "bmi2"))]
+    false
+}
+
+/// The slider indexing in use: "pext" or "magic".
+pub fn slider_indexing() -> &'static str {
+    if unsafe { USE_PEXT } {
+        "pext"
+    } else {
+        "magic"
+    }
 }
 
 /// Fills square sq's block of SLIDE at `off` with the attacks for every
@@ -287,6 +319,7 @@ fn init_tables() {
             PAWN_ATT[0][sq] = ((b & !FILE_A) << 7) | ((b & !FILE_H) << 9);
             PAWN_ATT[1][sq] = ((b & !FILE_A) >> 9) | ((b & !FILE_H) >> 7);
         }
+        USE_PEXT = pext_wanted();
         let mut off = 0usize;
         for sq in 0..64usize {
             R_OFF[sq] = off;
