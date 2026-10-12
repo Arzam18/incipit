@@ -101,7 +101,18 @@ fn build_fathom(dir: &std::path::Path) {
         .arg(&out)
         .status();
     match status {
-        Ok(s) if s.success() => println!("cargo:rustc-link-arg={}", out.display()),
+        Ok(s) if s.success() => {
+            println!("cargo:rustc-link-arg={}", out.display());
+            // rustc puts link args after the system libraries, and GNU ld only
+            // resolves symbols against libraries that come later, so on MinGW
+            // repeat the runtime libraries Fathom needs after fathom.o.
+            let target = env::var("TARGET").unwrap_or_default();
+            if target.ends_with("windows-gnu") {
+                for lib in ["-lmingwex", "-lmsvcrt", "-lgcc", "-lkernel32"] {
+                    println!("cargo:rustc-link-arg={lib}");
+                }
+            }
+        }
         _ => {
             eprintln!("error: compiling the Fathom tablebase prober with `{}` failed (set CC to a C compiler)", cc);
             process::exit(1);
