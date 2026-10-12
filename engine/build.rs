@@ -36,6 +36,13 @@ fn main() {
     if rustc_minor() >= 89 {
         println!("cargo:rustc-cfg=avx512_intrinsics");
     }
+    // The NEON dot product (vdotq_s32) is stable from Rust 1.98; with an older
+    // compiler arm64 builds use the multiply + pairwise-add version even on
+    // CPUs with dotprod.
+    println!("cargo:rustc-check-cfg=cfg(neon_dotprod)");
+    if rustc_minor() >= 98 {
+        println!("cargo:rustc-cfg=neon_dotprod");
+    }
     build_fathom(&dir);
     version(&dir);
 }

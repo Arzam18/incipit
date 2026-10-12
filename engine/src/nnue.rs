@@ -2457,11 +2457,11 @@ unsafe fn dot4(
     w: std::arch::aarch64::int8x16_t,
 ) -> std::arch::aarch64::int32x4_t {
     use std::arch::aarch64::*;
-    #[cfg(target_feature = "dotprod")]
+    #[cfg(all(neon_dotprod, target_feature = "dotprod"))]
     {
         vdotq_s32(acc, x, w)
     }
-    #[cfg(not(target_feature = "dotprod"))]
+    #[cfg(not(all(neon_dotprod, target_feature = "dotprod")))]
     {
         // i8 x i8 products fit i16; pairs, then pairs of pairs, to i32.
         let lo = vpaddlq_s16(vmull_s8(vget_low_s8(x), vget_low_s8(w)));
