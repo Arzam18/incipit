@@ -1,13 +1,13 @@
-# Release builds: Linux and Windows (cross-compiled with MinGW) for three
-# x86-64 levels, smoke-tested on both systems, then attached to a draft
-# GitHub release when a v* tag is pushed. Run it by hand (Actions tab ->
-# release -> Run workflow) to get the binaries as artifacts without a release.
+# Release builds: one universal x86-64 binary each for Linux and Windows
+# (cross-compiled with MinGW), smoke-tested on both systems, then attached to
+# a draft GitHub release when a v* tag is pushed. Run it by hand (Actions tab
+# -> release -> Run workflow) to get the binaries as artifacts without a
+# release.
 #
-# Until the binary dispatches on the CPU at run time, each level is its own
-# build:
-#   v3         x86-64-v3 (AVX2, BMI2/PEXT): modern Intel, AMD Zen 3 and later
-#   v3-nopext  x86-64-v3 without BMI2 (PEXT is slow on AMD Zen 1 and Zen 2)
-#   v4         x86-64-v4 (AVX-512)
+# The binaries need x86-64-v3 (AVX2, BMI2; Intel Haswell / AMD Zen 1 and
+# later) and choose the rest at start-up: AVX-512 (+VNNI) NNUE kernels where
+# the CPU has them, PEXT slider indexing except on AMD Zen 1/2 (magic
+# multiply there). `bench` prints the choice.
 name: release
 
 on:
@@ -44,26 +44,20 @@ jobs:
           net="$PWD/$(basename "$(cat net.txt)")"
           ver=$(git describe --tags --always)
           mkdir -p ../dist
-          for level in v3 v3-nopext v4; do
-            case $level in
-              v3)        cpu="-Ctarget-cpu=x86-64-v3" ;;
-              v3-nopext) cpu="-Ctarget-cpu=x86-64-v3 -Ctarget-feature=-bmi2" ;;
-              v4)        cpu="-Ctarget-cpu=x86-64-v4" ;;
-            esac
-            for target in x86_64-unknown-linux-gnu x86_64-pc-windows-gnu; do
-              if [ $target = x86_64-pc-windows-gnu ]; then cc=x86_64-w64-mingw32-gcc; os=windows; ext=.exe
-              else cc=cc; os=linux; ext=; fi
-              CC=$cc EVALFILE="$net" RUSTFLAGS="$cpu -Ctarget-feature=+crt-static" \
-                cargo build --release --target $target
-              cp target/$target/release/incipit$ext ../dist/incipit-$ver-$os-x86-64-$level$ext
-            done
+          for target in x86_64-unknown-linux-gnu x86_64-pc-windows-gnu; do
+            if [ $target = x86_64-pc-windows-gnu ]; then cc=x86_64-w64-mingw32-gcc; os=windows; ext=.exe
+            else cc=cc; os=linux; ext=; fi
+            CC=$cc EVALFILE="$net" RUSTFLAGS="-Ctarget-cpu=x86-64-v3 -Ctarget-feature=+crt-static" \
+              cargo build --release --target $target
+            cp target/$target/release/incipit$ext ../dist/incipit-$ver-$os-x86-64$ext
           done
           ls -l ../dist
 
       - name: Check Linux builds
         run: |
           want=$(git log -50 --format=%B | sed -n 's/^Bench: \([0-9]*\)$/\1/p' | head -1)
-          for f in dist/*-linux-x86-64-v3 dist/*-linux-x86-64-v3-nopext; do
+          for f in dist/*-linux-x86-64; do
+            "$f" bench | tail -2 | head -1
             got=$("$f" bench | tail -1 | cut -d' ' -f1)
             echo "$f: bench $got (want $want)"
             [ "$got" = "$want" ]
@@ -89,7 +83,8 @@ jobs:
         shell: bash
         run: |
           want=$(git log -50 --format=%B | sed -n 's/^Bench: \([0-9]*\)$/\1/p' | head -1)
-          for f in dist/*-windows-x86-64-v3.exe dist/*-windows-x86-64-v3-nopext.exe; do
+          for f in dist/*-windows-x86-64.exe; do
+            "$f" bench | tail -2 | head -1
             got=$("$f" bench | tail -1 | cut -d' ' -f1)
             echo "$f: bench $got (want $want)"
             [ "$got" = "$want" ]
