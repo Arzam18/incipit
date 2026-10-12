@@ -92,14 +92,16 @@ fn build_fathom(dir: &std::path::Path) {
     println!("cargo:rerun-if-env-changed=CC");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("fathom.o");
     let cc = env::var("CC").unwrap_or_else(|_| "cc".into());
-    let status = process::Command::new(&cc)
-        .args(["-std=gnu99", "-O2", "-fPIC", "-w", "-c"])
-        .arg("-I")
-        .arg(&src)
-        .arg(src.join("tbprobe.c"))
-        .arg("-o")
-        .arg(&out)
-        .status();
+    let mut cmd = process::Command::new(&cc);
+    cmd.args(["-std=gnu99", "-O2", "-fPIC", "-w", "-c"]);
+    // Apple's clang builds for the host by default; name the target's
+    // architecture so an x86-64 build on an arm64 Mac (or the reverse) gets
+    // an object the linker accepts.
+    if env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple") {
+        let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        cmd.args(["-arch", if arch == "aarch64" { "arm64" } else { &arch }]);
+    }
+    let status = cmd.arg("-I").arg(&src).arg(src.join("tbprobe.c")).arg("-o").arg(&out).status();
     match status {
         Ok(s) if s.success() => {
             println!("cargo:rustc-link-arg={}", out.display());
