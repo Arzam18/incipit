@@ -629,8 +629,14 @@ fn main() {
                                     println!("info string {} ignored: search parameters are constants in this build (make TUNE=1)", name);
                                 }
                             } else if let Ok(v) = val.parse::<i32>() {
+                                let scale = params::tp(params::P::EvalScale);
                                 if params::set(other, v) {
                                     uci.searcher.init_lmr();
+                                    // Cached evals, TT scores and correction history are
+                                    // at the old eval scale: start again, as a new game does.
+                                    if params::tp(params::P::EvalScale) != scale {
+                                        uci.searcher.clear();
+                                    }
                                 }
                             }
                         }
