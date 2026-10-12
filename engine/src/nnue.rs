@@ -76,6 +76,7 @@ pub struct Network {
     ow: Aligned,  // [output bucket][2h], side to move first
     ob: Vec<i32>, // [output bucket]
     l1: Option<Hidden>,
+    eval: EvalFn, // chosen by pick_eval at load
 }
 
 /// One hidden layer between the feature transformer and the output: the FT
@@ -210,6 +211,12 @@ fn init_net() {
 
 /// Parses and validates a network file.
 pub fn load(d: &[u8]) -> Result<Network, String> {
+    let mut n = load_layers(d)?;
+    n.eval = pick_eval(&n);
+    Ok(n)
+}
+
+fn load_layers(d: &[u8]) -> Result<Network, String> {
     let u16_at = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
     let u32_at = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
     if d.len() < 16 || &d[0..8] != MAGIC {
@@ -375,6 +382,7 @@ pub fn load(d: &[u8]) -> Result<Network, String> {
         ow,
         ob,
         l1: None,
+        eval: eval_n_entry::<0>, // replaced by load()
     })
 }
 
@@ -579,6 +587,7 @@ fn load_hidden(
             bm,
             wo,
         }),
+        eval: eval_n_entry::<0>, // replaced by load()
     })
 }
 
@@ -932,82 +941,98 @@ impl Scratch {
 #[inline]
 pub fn evaluate(acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
     let n = net();
-    match &n.l1 {
-        None => with_h!(n.h, eval_n(n, acc, pos)),
-        Some(l1) if l1.pw && l1.dual && l1.n2 == 32 => with_h!(n.h, eval_hidden_pw16x32d(n, l1, acc, pos, s)),
-        Some(l1) if l1.pw && l1.dual => with_h!(n.h, eval_hidden_pw16x16d(n, l1, acc, pos, s)),
-        Some(l1) if l1.pw && l1.n2 == 32 => with_h!(n.h, eval_hidden_pw16x32(n, l1, acc, pos, s)),
-        Some(l1) if l1.pw && l1.n2 == 16 => with_h!(n.h, eval_hidden_pw16x16(n, l1, acc, pos, s)),
-        Some(l1) if l1.pw => with_h!(n.h, eval_hidden_pw16(n, l1, acc, pos, s)),
-        Some(l1) if l1.dual && l1.n2 == 32 => with_h!(n.h, eval_hidden16x32d(n, l1, acc, pos, s)),
-        Some(l1) if l1.dual => with_h!(n.h, eval_hidden16x16d(n, l1, acc, pos, s)),
-        Some(l1) if l1.n2 == 32 => with_h!(n.h, eval_hidden16x32(n, l1, acc, pos, s)),
-        Some(l1) if l1.n2 == 16 => with_h!(n.h, eval_hidden16x16(n, l1, acc, pos, s)),
-        Some(l1) if l1.n == 8 => with_h!(n.h, eval_hidden8(n, l1, acc, pos, s)),
-        Some(l1) => with_h!(n.h, eval_hidden16(n, l1, acc, pos, s)),
-    }
+    // Safe: pick_eval chose a function for this network's shape (and only an
+    // AVX-512 one on a CPU that has the features).
+    unsafe { (n.eval)(n, acc, pos, s) }
 }
 
 /// Network with one hidden layer: u8 inputs from both perspectives (side to
 /// move first), an int8 matrix product per output bucket, then float SCReLU
-/// and the float output layer.
-#[inline(never)]
-fn eval_hidden16<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 16, 0, false, false>(n, l1, acc, pos, s)
+/// and the float output layer. One entry point per layer shape and hidden
+/// size, each in an AVX2 and (where the compiler has the intrinsics) an
+/// AVX-512 version; `pick_eval` chooses one at net load.
+type EvalFn = unsafe fn(&Network, &Acc, &Position, &mut Scratch) -> i32;
+
+macro_rules! eval_entries {
+    ($($name:ident, $wide:ident: $l:expr, $l2:expr, $pw:expr, $dual:expr;)*) => {$(
+        #[inline(never)]
+        unsafe fn $name<const H: usize>(n: &Network, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
+            eval_hidden::<H, $l, $l2, $pw, $dual, false>(n, n.l1.as_ref().unwrap_unchecked(), acc, pos, s)
+        }
+        #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+        #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+        #[inline(never)]
+        unsafe fn $wide<const H: usize>(n: &Network, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
+            eval_hidden::<H, $l, $l2, $pw, $dual, true>(n, n.l1.as_ref().unwrap_unchecked(), acc, pos, s)
+        }
+    )*};
 }
 
-#[inline(never)]
-fn eval_hidden8<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 8, 0, false, false>(n, l1, acc, pos, s)
+eval_entries! {
+    eval_hidden16, eval_hidden16_x512: 16, 0, false, false;
+    eval_hidden8, eval_hidden8_x512: 8, 0, false, false;
+    eval_hidden16x16d, eval_hidden16x16d_x512: 16, 16, false, true;
+    eval_hidden16x32d, eval_hidden16x32d_x512: 16, 32, false, true;
+    eval_hidden_pw16, eval_hidden_pw16_x512: 16, 0, true, false;
+    eval_hidden_pw16x16, eval_hidden_pw16x16_x512: 16, 16, true, false;
+    eval_hidden_pw16x32, eval_hidden_pw16x32_x512: 16, 32, true, false;
+    eval_hidden_pw16x16d, eval_hidden_pw16x16d_x512: 16, 16, true, true;
+    eval_hidden_pw16x32d, eval_hidden_pw16x32d_x512: 16, 32, true, true;
+    eval_hidden16x16, eval_hidden16x16_x512: 16, 16, false, false;
+    eval_hidden16x32, eval_hidden16x32_x512: 16, 32, false, false;
 }
 
-#[inline(never)]
-fn eval_hidden16x16d<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 16, 16, false, true>(n, l1, acc, pos, s)
+unsafe fn eval_n_entry<const H: usize>(n: &Network, acc: &Acc, pos: &Position, _s: &mut Scratch) -> i32 {
+    eval_n::<H>(n, acc, pos)
 }
 
-#[inline(never)]
-fn eval_hidden16x32d<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 16, 32, false, true>(n, l1, acc, pos, s)
-}
-
-#[inline(never)]
-fn eval_hidden_pw16<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 16, 0, true, false>(n, l1, acc, pos, s)
-}
-
-#[inline(never)]
-fn eval_hidden_pw16x16<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 16, 16, true, false>(n, l1, acc, pos, s)
-}
-
-#[inline(never)]
-fn eval_hidden_pw16x32<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 16, 32, true, false>(n, l1, acc, pos, s)
-}
-
-#[inline(never)]
-fn eval_hidden_pw16x16d<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 16, 16, true, true>(n, l1, acc, pos, s)
-}
-
-#[inline(never)]
-fn eval_hidden_pw16x32d<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 16, 32, true, true>(n, l1, acc, pos, s)
-}
-
-#[inline(never)]
-fn eval_hidden16x16<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 16, 16, false, false>(n, l1, acc, pos, s)
-}
-
-#[inline(never)]
-fn eval_hidden16x32<const H: usize>(n: &Network, l1: &Hidden, acc: &Acc, pos: &Position, s: &mut Scratch) -> i32 {
-    eval_hidden::<H, 16, 32, false, false>(n, l1, acc, pos, s)
+/// The evaluation function for the loaded network: its layer shape, hidden
+/// size (a constant for the common sizes) and the CPU's kernel width. Chosen
+/// once here, so an evaluation is one indirect call.
+fn pick_eval(n: &Network) -> EvalFn {
+    macro_rules! sized {
+        ($f:ident) => {
+            match n.h {
+                128 => $f::<128> as EvalFn,
+                256 => $f::<256> as EvalFn,
+                512 => $f::<512> as EvalFn,
+                768 => $f::<768> as EvalFn,
+                1024 => $f::<1024> as EvalFn,
+                1536 => $f::<1536> as EvalFn,
+                2048 => $f::<2048> as EvalFn,
+                _ => $f::<0> as EvalFn,
+            }
+        };
+    }
+    #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+    let w = wide();
+    macro_rules! pick {
+        ($f:ident, $g:ident) => {{
+            #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+            if w {
+                return sized!($g);
+            }
+            sized!($f)
+        }};
+    }
+    match &n.l1 {
+        None => sized!(eval_n_entry),
+        Some(l1) if l1.pw && l1.dual && l1.n2 == 32 => pick!(eval_hidden_pw16x32d, eval_hidden_pw16x32d_x512),
+        Some(l1) if l1.pw && l1.dual => pick!(eval_hidden_pw16x16d, eval_hidden_pw16x16d_x512),
+        Some(l1) if l1.pw && l1.n2 == 32 => pick!(eval_hidden_pw16x32, eval_hidden_pw16x32_x512),
+        Some(l1) if l1.pw && l1.n2 == 16 => pick!(eval_hidden_pw16x16, eval_hidden_pw16x16_x512),
+        Some(l1) if l1.pw => pick!(eval_hidden_pw16, eval_hidden_pw16_x512),
+        Some(l1) if l1.dual && l1.n2 == 32 => pick!(eval_hidden16x32d, eval_hidden16x32d_x512),
+        Some(l1) if l1.dual => pick!(eval_hidden16x16d, eval_hidden16x16d_x512),
+        Some(l1) if l1.n2 == 32 => pick!(eval_hidden16x32, eval_hidden16x32_x512),
+        Some(l1) if l1.n2 == 16 => pick!(eval_hidden16x16, eval_hidden16x16_x512),
+        Some(l1) if l1.n == 8 => pick!(eval_hidden8, eval_hidden8_x512),
+        Some(_) => pick!(eval_hidden16, eval_hidden16_x512),
+    }
 }
 
 #[inline(always)]
-fn eval_hidden<const H: usize, const L: usize, const L2: usize, const PW: bool, const DUAL: bool>(
+fn eval_hidden<const H: usize, const L: usize, const L2: usize, const PW: bool, const DUAL: bool, const W: bool>(
     n: &Network,
     l1: &Hidden,
     acc: &Acc,
@@ -1023,24 +1048,24 @@ fn eval_hidden<const H: usize, const L: usize, const L2: usize, const PW: bool, 
     let count = if PW {
         let (us, them) = (acc.side(pos.stm, h), acc.side(pos.stm ^ 1, h));
         if n.qa == 255 && l1.shift == 9 {
-            unsafe { to_u8_pw_nz_255_9(us, them, &mut x.0[..h], nz) }
+            unsafe { to_u8_pw_nz_w::<W>(us, them, &mut x.0[..h], nz) }
         } else {
             to_u8_pw_scalar(us, &mut x.0[..h / 2], n.qa, l1.shift);
             to_u8_pw_scalar(them, &mut x.0[h / 2..h], n.qa, l1.shift);
-            unsafe { scan_nz(&x.0[..h], nz) }
+            unsafe { scan_nz_w::<W>(&x.0[..h], nz) }
         }
     } else if n.qa == 255 && l1.shift == 9 {
         // Converts and lists the non-zero groups in one pass.
-        unsafe { to_u8_nz_255_9(acc.side(pos.stm, h), acc.side(pos.stm ^ 1, h), &mut x.0[..2 * h], nz) }
+        unsafe { to_u8_nz_w::<W>(acc.side(pos.stm, h), acc.side(pos.stm ^ 1, h), &mut x.0[..2 * h], nz) }
     } else {
         to_u8_scalar(acc.side(pos.stm, h), &mut x.0[..h], n.qa, l1.shift);
         to_u8_scalar(acc.side(pos.stm ^ 1, h), &mut x.0[h..2 * h], n.qa, l1.shift);
-        unsafe { scan_nz(&x.0[..2 * h], nz) }
+        unsafe { scan_nz_w::<W>(&x.0[..2 * h], nz) }
     };
     // A shared hidden layer has one block for all buckets (branch-free).
     let b1i = bucket & !(l1.shared as usize).wrapping_neg();
     let w = &l1.w1[b1i * L * inl..(b1i + 1) * L * inl];
-    let z = unsafe { l1_product::<L>(&x.0[..inl], &nz[..count + 8], count, w) };
+    let z = unsafe { l1_product::<L, W>(&x.0[..inl], &nz[..count + 8], count, w) };
     let k = 1.0 / (l1.in_scale * l1.w_scale);
     // The float layers, 8 lanes at a time with AVX2 (every build has it; the
     // x86-64-v3 baseline). Separate multiply and add (no FMA) and a fixed
@@ -1332,15 +1357,6 @@ unsafe fn l1_product8(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_
 /// fits 0..127). Rounding rather than flooring halves the quantisation error
 /// of the hidden layer's inputs and removes its downward bias. The usual
 /// QA 255 / shift 9 has SIMD versions; a.len() is a multiple of 32.
-#[inline(always)]
-fn to_u8(a: &[i16], x: &mut [u8], qa: i32, shift: u32) {
-    if qa == 255 && shift == 9 {
-        unsafe { to_u8_255_9(a, x) }
-    } else {
-        to_u8_scalar(a, x, qa, shift)
-    }
-}
-
 fn to_u8_scalar(a: &[i16], x: &mut [u8], qa: i32, shift: u32) {
     for (o, &v) in x.iter_mut().zip(a) {
         let c = (v as i32).clamp(0, qa);
@@ -1367,9 +1383,10 @@ fn round_shift(v: i32, shift: u32) -> i32 {
 /// QA 255, shift 9: (c * c + 256) >> 9 = mulhrs_i16(c << 6, c), the rounding
 /// high product (64 * c * c + 2^14) >> 15; c << 6 fits i16 and the result is
 /// at most 127.
-#[cfg(all(avx512_intrinsics, target_feature = "avx512bw"))]
-#[inline(always)]
-unsafe fn to_u8_255_9(a: &[i16], x: &mut [u8]) {
+#[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[inline]
+unsafe fn to_u8_255_9_x512(a: &[i16], x: &mut [u8]) {
     use std::arch::x86_64::*;
     let zero = _mm512_setzero_si512();
     let qa = _mm512_set1_epi16(255);
@@ -1394,9 +1411,10 @@ unsafe fn to_u8_255_9(a: &[i16], x: &mut [u8]) {
 /// to_u8 (QA 255, shift 9) of both perspectives into x (a0 then a1), listing
 /// the non-zero 4-input groups in nz as each 64-byte block is produced (no
 /// second pass over x). Returns the number of groups listed.
-#[cfg(all(avx512_intrinsics, target_feature = "avx512bw"))]
-#[inline(always)]
-unsafe fn to_u8_nz_255_9(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]) -> usize {
+#[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[inline]
+unsafe fn to_u8_nz_255_9_x512(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]) -> usize {
     use std::arch::x86_64::*;
     let zero = _mm512_setzero_si512();
     let qa = _mm512_set1_epi16(255);
@@ -1432,9 +1450,10 @@ unsafe fn to_u8_nz_255_9(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]) -
 /// Pairwise version of to_u8_nz_255_9: per perspective, the first half times
 /// the second half, (c1 * c2 + 256) >> 9 = mulhrs_i16(c1 << 6, c2); h/2 outputs each
 /// (h/2 is a multiple of 64).
-#[cfg(all(avx512_intrinsics, target_feature = "avx512bw"))]
-#[inline(always)]
-unsafe fn to_u8_pw_nz_255_9(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]) -> usize {
+#[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[inline]
+unsafe fn to_u8_pw_nz_255_9_x512(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]) -> usize {
     use std::arch::x86_64::*;
     let zero = _mm512_setzero_si512();
     let qa = _mm512_set1_epi16(255);
@@ -1460,7 +1479,7 @@ unsafe fn to_u8_pw_nz_255_9(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]
 }
 
 /// AVX2 version of to_u8_pw_nz_255_9.
-#[cfg(all(target_arch = "x86_64", not(all(avx512_intrinsics, target_feature = "avx512bw"))))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn to_u8_pw_nz_255_9(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]) -> usize {
     use std::arch::x86_64::*;
@@ -1486,7 +1505,7 @@ unsafe fn to_u8_pw_nz_255_9(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]
 }
 
 /// AVX2 version of to_u8_nz_255_9.
-#[cfg(all(target_arch = "x86_64", not(all(avx512_intrinsics, target_feature = "avx512bw"))))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn to_u8_nz_255_9(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]) -> usize {
     use std::arch::x86_64::*;
@@ -1513,7 +1532,7 @@ unsafe fn to_u8_nz_255_9(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]) -
     count
 }
 
-#[cfg(all(target_arch = "x86_64", not(all(avx512_intrinsics, target_feature = "avx512bw"))))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn to_u8_255_9(a: &[i16], x: &mut [u8]) {
     use std::arch::x86_64::*;
@@ -1570,18 +1589,19 @@ unsafe fn push_nz(nz: &mut [u16], count: usize, m: u32, base: u16) -> usize {
 /// [in / 4][out][in % 4] layout. x.len() is a multiple of 64. (Scan, then
 /// product; eval_hidden fuses the scan into the u8 conversion instead.)
 #[inline(always)]
-fn l1_matmul<const L: usize>(x: &[u8], w: &[i8]) -> [i32; L1_SIZE] {
+fn l1_matmul<const L: usize, const W: bool>(x: &[u8], w: &[i8]) -> [i32; L1_SIZE] {
     let mut nz = [0u16; 2 * MAX_H / 4 + 8];
     unsafe {
-        let count = scan_nz(x, &mut nz);
-        l1_product::<L>(x, &nz[..count + 8], count, w)
+        let count = scan_nz_w::<W>(x, &mut nz);
+        l1_product::<L, W>(x, &nz[..count + 8], count, w)
     }
 }
 
 /// Lists the 4-input groups of x with any non-zero input; returns the count.
-#[cfg(all(avx512_intrinsics, target_feature = "avx512bw"))]
-#[inline(always)]
-unsafe fn scan_nz(x: &[u8], nz: &mut [u16]) -> usize {
+#[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[inline]
+unsafe fn scan_nz_x512(x: &[u8], nz: &mut [u16]) -> usize {
     use std::arch::x86_64::*;
     let mut count = 0;
     for c in (0..x.len()).step_by(64) {
@@ -1593,7 +1613,7 @@ unsafe fn scan_nz(x: &[u8], nz: &mut [u16]) -> usize {
     count
 }
 
-#[cfg(all(target_arch = "x86_64", not(all(avx512_intrinsics, target_feature = "avx512bw"))))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn scan_nz(x: &[u8], nz: &mut [u16]) -> usize {
     use std::arch::x86_64::*;
@@ -1608,27 +1628,23 @@ unsafe fn scan_nz(x: &[u8], nz: &mut [u16]) -> usize {
 }
 
 /// AVX-512: one register holds all 16 outputs; each group of 4 inputs is a
-/// broadcast and one VNNI dpbusd (or maddubs + madd without VNNI). Inputs are
+/// broadcast and one VNNI dpbusd (the AVX-512 kernels need VNNI; without it
+/// the AVX2 ones run). Inputs are
 /// at most 127 and weights within +-127, so maddubs's i16 sums can't overflow.
-#[cfg(all(avx512_intrinsics, target_feature = "avx512bw"))]
-#[inline(always)]
-unsafe fn l1_product16(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_SIZE] {
+#[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[inline]
+unsafe fn l1_product16_x512(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_SIZE] {
     use std::arch::x86_64::*;
     let (xp, wp) = (x.as_ptr() as *const i32, w.as_ptr());
     let mut s0 = _mm512_setzero_si512();
     let mut s1 = _mm512_setzero_si512();
-    #[inline(always)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    #[inline]
     unsafe fn step(s: __m512i, xg: i32, wg: *const i8) -> __m512i {
         let xb = _mm512_set1_epi32(xg);
         let wv = _mm512_load_si512(wg as *const __m512i);
-        #[cfg(target_feature = "avx512vnni")]
-        {
-            _mm512_dpbusd_epi32(s, xb, wv)
-        }
-        #[cfg(not(target_feature = "avx512vnni"))]
-        {
-            _mm512_add_epi32(s, _mm512_madd_epi16(_mm512_maddubs_epi16(xb, wv), _mm512_set1_epi16(1)))
-        }
+        _mm512_dpbusd_epi32(s, xb, wv)
     }
     // SCReLU leaves most inputs at zero: only the listed groups of 4 with any
     // non-zero input are used (the others' weights aren't even loaded).
@@ -1663,7 +1679,7 @@ unsafe fn l1_product16(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1
 /// vpdpbusd with AVX-VNNI (VEX, e.g. Alder Lake and later without AVX-512),
 /// else maddubs + madd + add. Same result either way: x <= 127 and |w| <= 127
 /// keep maddubs's i16 pair sums (at most 32258) from saturating.
-#[cfg(all(target_arch = "x86_64", not(all(avx512_intrinsics, target_feature = "avx512bw"))))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn dpbusd256(
     acc: std::arch::x86_64::__m256i,
@@ -1681,7 +1697,7 @@ unsafe fn dpbusd256(
     }
 }
 
-#[cfg(all(target_arch = "x86_64", not(all(avx512_intrinsics, target_feature = "avx512bw"))))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn l1_product16(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_SIZE] {
     use std::arch::x86_64::*;
@@ -1711,8 +1727,13 @@ unsafe fn l1_product16(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1
 }
 
 /// The hidden-layer product for L (8 or 16) outputs; outputs past L are 0.
+/// W picks the AVX-512 kernels (see `wide`).
 #[inline(always)]
-unsafe fn l1_product<const L: usize>(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_SIZE] {
+unsafe fn l1_product<const L: usize, const W: bool>(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_SIZE] {
+    #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+    if W {
+        return if L == 8 { l1_product8_x512(x, nz, count, w) } else { l1_product16_x512(x, nz, count, w) };
+    }
     if L == 8 {
         l1_product8(x, nz, count, w)
     } else {
@@ -1720,14 +1741,88 @@ unsafe fn l1_product<const L: usize>(x: &[u8], nz: &[u16], count: usize, w: &[i8
     }
 }
 
+// Kernel width: W = true picks the AVX-512 (+VNNI) kernels. It is a constant
+// in each instantiation, so the choice compiles away; the W = true code only
+// runs in the AVX-512 eval entry points, chosen at net load on CPUs that have
+// the features (`wide`), whose target features let these kernels inline.
+
+#[inline(always)]
+unsafe fn to_u8_nz_w<const W: bool>(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]) -> usize {
+    #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+    if W {
+        return to_u8_nz_255_9_x512(a0, a1, x, nz);
+    }
+    to_u8_nz_255_9(a0, a1, x, nz)
+}
+
+#[inline(always)]
+unsafe fn to_u8_pw_nz_w<const W: bool>(a0: &[i16], a1: &[i16], x: &mut [u8], nz: &mut [u16]) -> usize {
+    #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+    if W {
+        return to_u8_pw_nz_255_9_x512(a0, a1, x, nz);
+    }
+    to_u8_pw_nz_255_9(a0, a1, x, nz)
+}
+
+#[inline(always)]
+unsafe fn scan_nz_w<const W: bool>(x: &[u8], nz: &mut [u16]) -> usize {
+    #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+    if W {
+        return scan_nz_x512(x, nz);
+    }
+    scan_nz(x, nz)
+}
+
+#[inline(always)]
+unsafe fn to_u8_255_9_w<const W: bool>(a: &[i16], x: &mut [u8]) {
+    #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+    if W {
+        return to_u8_255_9_x512(a, x);
+    }
+    to_u8_255_9(a, x)
+}
+
+/// Whether this CPU runs the AVX-512 kernels: AVX-512 F, BW and VNNI (the
+/// kernels use VNNI's dpbusd; CPUs with AVX-512 but no VNNI run the AVX2
+/// ones). INCIPIT_ISA=avx2 forces the AVX2 kernels (for testing both on one
+/// machine).
+pub fn wide() -> bool {
+    #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+    {
+        if std::env::var("INCIPIT_ISA").is_ok_and(|v| v == "avx2") {
+            return false;
+        }
+        is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+    }
+    #[cfg(not(all(target_arch = "x86_64", avx512_intrinsics)))]
+    false
+}
+
+/// The NNUE kernels in use, for bench and diagnostics.
+pub fn kernel_isa() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "neon"
+    } else if !cfg!(target_arch = "x86_64") {
+        "portable"
+    } else if wide() {
+        "avx512"
+    } else {
+        "avx2"
+    }
+}
+
 /// AVX-512, 8 outputs: a group's weight row is 32 bytes, so two listed groups
 /// share one register (one in each half) and one VNNI dpbusd.
-#[cfg(all(avx512_intrinsics, target_feature = "avx512bw"))]
-#[inline(always)]
-unsafe fn l1_product8(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_SIZE] {
+#[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[inline]
+unsafe fn l1_product8_x512(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_SIZE] {
     use std::arch::x86_64::*;
     let (xp, wp) = (x.as_ptr() as *const i32, w.as_ptr());
-    #[inline(always)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    #[inline]
     unsafe fn step(s: __m512i, xa: i32, xb: i32, wa: *const i8, wb: *const i8) -> __m512i {
         let xv = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi32(xa)), _mm256_set1_epi32(xb), 1);
         let wv = _mm512_inserti64x4(
@@ -1735,14 +1830,7 @@ unsafe fn l1_product8(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_
             _mm256_load_si256(wb as *const __m256i),
             1,
         );
-        #[cfg(target_feature = "avx512vnni")]
-        {
-            _mm512_dpbusd_epi32(s, xv, wv)
-        }
-        #[cfg(not(target_feature = "avx512vnni"))]
-        {
-            _mm512_add_epi32(s, _mm512_madd_epi16(_mm512_maddubs_epi16(xv, wv), _mm512_set1_epi16(1)))
-        }
+        _mm512_dpbusd_epi32(s, xv, wv)
     }
     let g = |i: usize| *nz.get_unchecked(i) as usize;
     let mut s0 = _mm512_setzero_si512();
@@ -1768,7 +1856,7 @@ unsafe fn l1_product8(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_
 }
 
 /// AVX2, 8 outputs: one register per group; maddubs + madd.
-#[cfg(all(target_arch = "x86_64", not(all(avx512_intrinsics, target_feature = "avx512bw"))))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn l1_product8(x: &[u8], nz: &[u16], count: usize, w: &[i8]) -> [i32; L1_SIZE] {
     use std::arch::x86_64::*;
@@ -1903,6 +1991,54 @@ unsafe fn dot<const SCRELU: bool>(a: &[i16], w: &[i16], qa: i32) -> i32 {
 
 /// Checks the SIMD hidden-layer kernels against the scalar versions on random
 /// accumulators and weights. Returns the number of mismatches.
+/// The SIMD kernels of one width (W: AVX-512) against the scalar versions,
+/// for accumulators `a` (2h values), their scalar u8 conversion x2, int8
+/// weights w and sparse inputs xs. Returns the number of mismatches.
+fn check_kernels<const W: bool>(a: &[i16], h: usize, x2: &[u8], w: &[i8], xs: &[u8]) -> usize {
+    let mut bad = 0;
+    let mut x1 = vec![0u8; 2 * h];
+    unsafe { to_u8_255_9_w::<W>(a, &mut x1) };
+    if x1 != x2 {
+        return 1;
+    }
+    // Fused conversion + scan (two halves) vs conversion then scan.
+    let mut x3 = vec![0u8; 2 * h];
+    let mut nz1 = vec![0u16; 2 * h / 4 + 8];
+    let mut nz2 = vec![0u16; 2 * h / 4 + 8];
+    let c1 = unsafe { to_u8_nz_w::<W>(&a[..h], &a[h..], &mut x3, &mut nz1) };
+    let c2 = scan_nz_scalar(x2, &mut nz2);
+    if x3 != x2 || c1 != c2 || nz1[..c1] != nz2[..c2] {
+        return 1;
+    }
+    let c3 = unsafe { scan_nz_w::<W>(x2, &mut nz1) };
+    if c3 != c2 || nz1[..c3] != nz2[..c2] {
+        return 1;
+    }
+    // Pairwise conversion + scan vs scalar (h/2 per perspective).
+    if h % 128 == 0 {
+        let mut p1 = vec![0u8; h];
+        let mut p2 = vec![0u8; h];
+        let mut pz1 = vec![0u16; h / 4 + 8];
+        let mut pz2 = vec![0u16; h / 4 + 8];
+        let d1 = unsafe { to_u8_pw_nz_w::<W>(&a[..h], &a[h..], &mut p1, &mut pz1) };
+        to_u8_pw_scalar(&a[..h], &mut p2[..h / 2], 255, 9);
+        to_u8_pw_scalar(&a[h..], &mut p2[h / 2..], 255, 9);
+        let d2 = scan_nz_scalar(&p2, &mut pz2);
+        if p1 != p2 || d1 != d2 || pz1[..d1] != pz2[..d2] {
+            return 1;
+        }
+    }
+    for x in [x2, xs] {
+        if l1_matmul::<16, W>(x, w) != l1_matmul_scalar(x, w, 16) {
+            bad += 1;
+        }
+        if l1_matmul::<8, W>(x, &w[..8 * 2 * h]) != l1_matmul_scalar(x, &w[..8 * 2 * h], 8) {
+            bad += 1;
+        }
+    }
+    bad
+}
+
 pub fn l1check(trials: usize) -> usize {
     let mut seed = 0x2545F4914F6CDD1Du64;
     let mut rnd = || {
@@ -1915,62 +2051,19 @@ pub fn l1check(trials: usize) -> usize {
     for &h in &[128usize, 256, 512, 768, 1024, 2048] {
         for _ in 0..trials {
             let a: Vec<i16> = (0..2 * h).map(|_| (rnd() % 700) as i16 - 200).collect();
-            let mut x1 = vec![0u8; 2 * h];
             let mut x2 = vec![0u8; 2 * h];
-            to_u8(&a, &mut x1, 255, 9);
             to_u8_scalar(&a, &mut x2, 255, 9);
-            if x1 != x2 {
-                bad += 1;
-                continue;
-            }
-            // Fused conversion + scan (two halves) vs conversion then scan.
-            let mut x3 = vec![0u8; 2 * h];
-            let mut nz1 = vec![0u16; 2 * h / 4 + 8];
-            let mut nz2 = vec![0u16; 2 * h / 4 + 8];
-            let c1 = unsafe { to_u8_nz_255_9(&a[..h], &a[h..], &mut x3, &mut nz1) };
-            let c2 = scan_nz_scalar(&x2, &mut nz2);
-            if x3 != x2 || c1 != c2 || nz1[..c1] != nz2[..c2] {
-                bad += 1;
-                continue;
-            }
-            let c3 = unsafe { scan_nz(&x2, &mut nz1) };
-            if c3 != c2 || nz1[..c3] != nz2[..c2] {
-                bad += 1;
-                continue;
-            }
-            // Pairwise conversion + scan vs scalar (h/2 per perspective).
-            if h % 128 == 0 {
-                let mut p1 = vec![0u8; h];
-                let mut p2 = vec![0u8; h];
-                let mut pz1 = vec![0u16; h / 4 + 8];
-                let mut pz2 = vec![0u16; h / 4 + 8];
-                let d1 = unsafe { to_u8_pw_nz_255_9(&a[..h], &a[h..], &mut p1, &mut pz1) };
-                to_u8_pw_scalar(&a[..h], &mut p2[..h / 2], 255, 9);
-                to_u8_pw_scalar(&a[h..], &mut p2[h / 2..], 255, 9);
-                let d2 = scan_nz_scalar(&p2, &mut pz2);
-                if p1 != p2 || d1 != d2 || pz1[..d1] != pz2[..d2] {
-                    bad += 1;
-                    continue;
-                }
-            }
             let mut w = AlignedI8::zeroed(L1_SIZE * 2 * h);
             for v in w.iter_mut() {
                 *v = ((rnd() % 255) as i32 - 127) as i8;
             }
-            if l1_matmul::<16>(&x1, &w) != l1_matmul_scalar(&x1, &w, 16) {
-                bad += 1;
-            }
-            if l1_matmul::<8>(&x1, &w[..8 * 2 * h]) != l1_matmul_scalar(&x1, &w[..8 * 2 * h], 8) {
-                bad += 1;
-            }
             // Sparse inputs, as in real positions (few non-zero groups, odd counts).
             let keep = rnd() % 64;
-            let xs: Vec<u8> = x1.iter().map(|&v| if rnd() % 64 < keep { v } else { 0 }).collect();
-            if l1_matmul::<16>(&xs, &w) != l1_matmul_scalar(&xs, &w, 16) {
-                bad += 1;
-            }
-            if l1_matmul::<8>(&xs, &w[..8 * 2 * h]) != l1_matmul_scalar(&xs, &w[..8 * 2 * h], 8) {
-                bad += 1;
+            let xs: Vec<u8> = x2.iter().map(|&v| if rnd() % 64 < keep { v } else { 0 }).collect();
+            bad += check_kernels::<false>(&a, h, &x2, &w, &xs);
+            #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+            if wide() {
+                bad += check_kernels::<true>(&a, h, &x2, &w, &xs);
             }
         }
     }
