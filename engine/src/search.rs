@@ -783,9 +783,16 @@ impl Searcher {
         let lim = CORR_GRAIN * tp(P::CorrLimit);
         // Load then store, not an atomic read-modify-write: when two threads
         // update an entry at once one update is lost, which costs less.
+        // UseCorrIncr: each entry moves by w/256 of the residual (diff is the
+        // search score minus the already-corrected eval), so the tables settle
+        // where the corrected eval has no error left. Otherwise an average
+        // toward the residual, which settles at error / (1 + combined weight):
+        // the correction feeds back against itself and stays short.
+        let incr = on(P::UseCorrIncr);
         let f = |e: &AtomicI32| {
             let v = e.load(Ordering::Relaxed);
-            e.store(((v * (256 - w) + target * w) / 256).clamp(-lim, lim), Ordering::Relaxed)
+            let n = if incr { v + target * w / 256 } else { (v * (256 - w) + target * w) / 256 };
+            e.store(n.clamp(-lim, lim), Ordering::Relaxed)
         };
         let (corr, corr_np) = (&self.sh.corr[pos.stm], &self.sh.corr_np[pos.stm]);
         f(&corr[(pos.pawn_key as usize) & m]);
