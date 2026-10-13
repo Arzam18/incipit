@@ -555,8 +555,14 @@ impl Position {
                 b >> (-d)
             }
         }
+        // In check only moves that answer it can be legal (besides the king's):
+        // capturing a single checker or blocking its line; in double check none.
+        // The legality test in make_move still handles pins and king safety;
+        // this only spares generating and trying moves that can't help.
+        let evade = self.evade_mask();
         let push1 = sh(pawns, up) & empty;
-        for to in Bits(push1 & rank8) {
+        let pushes = push1 & evade;
+        for to in Bits(pushes & rank8) {
             let from = (to as i32 - up) as usize;
             list.push(mk(from, to, F_PROMO + 3));
             // The knight promotion counts as noisy too: it can mate or fork
@@ -568,8 +574,8 @@ impl Position {
             }
         }
         if !noisy_only {
-            let push2 = sh(push1 & rank3, up) & empty;
-            for to in Bits(push1 & !rank8) {
+            let push2 = sh(push1 & rank3, up) & empty & evade;
+            for to in Bits(pushes & !rank8) {
                 list.push(mk((to as i32 - up) as usize, to, F_QUIET));
             }
             for to in Bits(push2) {
@@ -577,7 +583,7 @@ impl Position {
             }
         }
         for (mask, d) in [(!FILE_A, up - 1), (!FILE_H, up + 1)] {
-            let caps = sh(pawns & mask, d) & enemy;
+            let caps = sh(pawns & mask, d) & enemy & evade;
             for to in Bits(caps & rank8) {
                 let from = (to as i32 - d) as usize;
                 list.push(mk(from, to, F_PROMO_CAP + 3));
@@ -589,7 +595,13 @@ impl Position {
                 list.push(mk((to as i32 - d) as usize, to, F_CAPTURE));
             }
         }
-        if self.ep != NO_SQ {
+        // En passant also answers a check by the pawn it captures (which isn't
+        // on the ep square itself).
+        let ep_ok = self.ep != NO_SQ && {
+            let victim = (self.ep as i32 - up) as usize;
+            evade >> self.ep & 1 != 0 || self.checkers >> victim & 1 != 0
+        };
+        if ep_ok {
             let e = self.ep as usize;
             for from in Bits(pawn_attacks(them, e) & pawns) {
                 list.push(mk(from, e, F_EP));
@@ -601,14 +613,15 @@ impl Position {
                 list.push(mk(from, to, if enemy & (1u64 << to) != 0 { F_CAPTURE } else { F_QUIET }));
             }
         };
+        let piece_targets = evade;
         for from in Bits(self.pcs(us, KNIGHT)) {
-            add(from, knight_attacks(from));
+            add(from, knight_attacks(from) & piece_targets);
         }
         for from in Bits((self.pieces[BISHOP] | self.pieces[QUEEN]) & self.colors[us]) {
-            add(from, bishop_attacks(from, occ));
+            add(from, bishop_attacks(from, occ) & piece_targets);
         }
         for from in Bits((self.pieces[ROOK] | self.pieces[QUEEN]) & self.colors[us]) {
-            add(from, rook_attacks(from, occ));
+            add(from, rook_attacks(from, occ) & piece_targets);
         }
         let ksq = self.king_sq(us);
         add(ksq, king_attacks(ksq));
@@ -775,6 +788,19 @@ impl Position {
         }
     }
 
+    /// Squares a non-king move must reach to answer a check: anywhere when not
+    /// in check, the checker or a square between it and the king in single
+    /// check, none in double check. (En passant can also capture the checker
+    /// from beside it; the generator allows for that.)
+    #[inline(always)]
+    fn evade_mask(&self) -> u64 {
+        match self.checkers.count_ones() {
+            0 => !0,
+            1 => self.checkers | between(self.king_sq(self.stm), self.checkers.trailing_zeros() as usize),
+            _ => 0,
+        }
+    }
+
     pub fn is_pseudo_legal(&self, m: Move) -> bool {
         if m == NO_MOVE {
             return false;
@@ -793,6 +819,10 @@ impl Position {
             return list.as_slice().contains(&m);
         }
         if from == to {
+            return false;
+        }
+        // In check the generator only makes moves that answer it (see gen_moves).
+        if pc_type(pc) != KING && self.evade_mask() >> to & 1 == 0 {
             return false;
         }
         let target = self.board[to];
