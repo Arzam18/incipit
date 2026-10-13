@@ -39,36 +39,36 @@ macro_rules! params {
 
 // name = UCI name, default, min, max, SPSA step (c_end). Step = (max - min) / 20, at least 1.
 params! {
-    RfpMargin = "RfpMargin", 71, 30, 150, 6;
+    RfpMargin = "RfpMargin", 75, 30, 150, 6;
     // Razoring at any depth: eval + RazorBase + RazorMul * depth^2 <= alpha. Starting values
     // fit the old tuned linear margin (242 + 312 * depth, depth <= 3) at depths 1 and 3.
-    RazorBase = "RazorBase", 483, 100, 800, 35;
-    RazorMul = "RazorMul", 86, 20, 200, 9;
-    NmpEvalDiv = "NmpEvalDiv", 173, 100, 400, 15;
-    ProbcutMargin = "ProbcutMargin", 219, 100, 350, 13;
-    FutBase = "FutBase", 92, 30, 250, 11;
-    FutMul = "FutMul", 96, 40, 200, 8;
-    HistPrune = "HistPrune", 3028, 500, 5000, 225;
-    SeeQuiet = "SeeQuiet", 9, 0, 80, 4;
+    RazorBase = "RazorBase", 509, 100, 800, 35;
+    RazorMul = "RazorMul", 79, 20, 200, 9;
+    NmpEvalDiv = "NmpEvalDiv", 165, 100, 400, 15;
+    ProbcutMargin = "ProbcutMargin", 221, 100, 350, 13;
+    FutBase = "FutBase", 82, 30, 250, 11;
+    FutMul = "FutMul", 93, 40, 200, 8;
+    HistPrune = "HistPrune", 3124, 500, 5000, 225;
+    SeeQuiet = "SeeQuiet", 8, 0, 80, 4;
     SeeNoisy = "SeeNoisy", 91, 10, 200, 10;
-    LmrBaseX100 = "LmrBaseX100", 47, 30, 130, 5;
-    LmrDivX100 = "LmrDivX100", 303, 150, 350, 10;
-    LmrHistDiv = "LmrHistDiv", 8293, 3000, 16000, 650;
-    AspDelta = "AspDelta", 11, 3, 40, 2;
-    HistMul = "HistMul", 299, 100, 500, 20;
-    HistOff = "HistOff", 198, 0, 500, 25;
-    HistMax = "HistMax", 2649, 1000, 4000, 150;
-    SeDouble = "SeDouble", 11, 5, 50, 2;
-    RfpDepth = "RfpDepth", 7, 3, 12, 1;
+    LmrBaseX100 = "LmrBaseX100", 44, 30, 130, 5;
+    LmrDivX100 = "LmrDivX100", 311, 150, 350, 10;
+    LmrHistDiv = "LmrHistDiv", 8418, 3000, 16000, 650;
+    AspDelta = "AspDelta", 15, 3, 40, 2;
+    HistMul = "HistMul", 302, 100, 500, 20;
+    HistOff = "HistOff", 187, 0, 500, 25;
+    HistMax = "HistMax", 2734, 1000, 4000, 150;
+    SeDouble = "SeDouble", 12, 5, 50, 2;
+    RfpDepth = "RfpDepth", 8, 3, 12, 1;
     // Null move needs static_eval >= beta - NmpDepthMul * depth + NmpMarginBase.
-    NmpDepthMul = "NmpDepthMul", 25, 0, 60, 3;
-    NmpMarginBase = "NmpMarginBase", 137, 0, 400, 20;
+    NmpDepthMul = "NmpDepthMul", 23, 0, 60, 3;
+    NmpMarginBase = "NmpMarginBase", 145, 0, 400, 20;
     // Largest |TT score| still used for a cutoff at halfmove >= 90 (half a pawn).
-    HmGuard = "HmGuard", 54, 0, 300, 15;
-    NmpBase = "NmpBase", 4, 2, 7, 1;
+    HmGuard = "HmGuard", 66, 0, 300, 15;
+    NmpBase = "NmpBase", 5, 2, 7, 1;
     LmpBase = "LmpBase", 5, 1, 8, 1;
-    SeMul = "SeMul", 23, 8, 40, 2;
-    CapLmrDiv = "CapLmrDiv", 3260, 2000, 16000, 700;
+    SeMul = "SeMul", 25, 8, 40, 2;
+    CapLmrDiv = "CapLmrDiv", 3416, 2000, 16000, 700;
     TmSoftDiv = "TmSoftDiv", 28, 12, 40, 1;
     TmIncPct = "TmIncPct", 79, 40, 100, 3;
     TmHardMul = "TmHardMul", 5, 2, 6, 1;
@@ -86,35 +86,35 @@ params! {
     TmFailLow = "TmFailLow", 30, 0, 100, 8;
     TmFeedMax = "TmFeedMax", 250, 100, 400, 20;
     // Depth gates (formerly constants).
-    NmpDepth = "NmpDepth", 3, 2, 6, 1;
+    NmpDepth = "NmpDepth", 2, 2, 6, 1;
     // Verify a null-move cutoff with a reduced real search from this depth on
     // (null move stays off at that ply). Start: 12, where a null-move cut
     // prunes a subtree deep enough for a zugzwang to matter.
     NmpVerifyDepth = "NmpVerifyDepth", 12, 6, 30, 2;
-    ProbcutDepth = "ProbcutDepth", 5, 3, 8, 1;
-    ProbcutRed = "ProbcutRed", 5, 2, 6, 1;
-    IirDepth = "IirDepth", 3, 2, 8, 1;
+    ProbcutDepth = "ProbcutDepth", 4, 3, 8, 1;
+    ProbcutRed = "ProbcutRed", 6, 2, 6, 1;
+    IirDepth = "IirDepth", 2, 2, 8, 1;
     FutDepth = "FutDepth", 9, 4, 12, 1;
-    HistPruneDepth = "HistPruneDepth", 4, 2, 8, 1;
+    HistPruneDepth = "HistPruneDepth", 5, 2, 8, 1;
     SeeNoisyDepth = "SeeNoisyDepth", 7, 3, 10, 1;
     // SEE piece values (pawn = 100), textbook starting values: used by SEE pruning,
     // ProbCut, qsearch SEE and capture ordering.
-    SeeKnight = "SeeKnight", 320, 150, 650, 25;
-    SeeBishop = "SeeBishop", 330, 150, 650, 25;
-    SeeRook = "SeeRook", 500, 250, 1000, 37;
-    SeeQueen = "SeeQueen", 950, 500, 2000, 75;
+    SeeKnight = "SeeKnight", 313, 150, 650, 25;
+    SeeBishop = "SeeBishop", 328, 150, 650, 25;
+    SeeRook = "SeeRook", 514, 250, 1000, 37;
+    SeeQueen = "SeeQueen", 951, 500, 2000, 75;
     SeDepth = "SeDepth", 6, 4, 10, 1;
     // Correction history. The eval correction is (CorrPawnWeight * pawn entry +
     // CorrNonPawnWeight * (white + black non-pawn entries)) / 128; the defaults are the
     // original 2:1:1 weighting, as separate weights so SPSA can move each one.
-    CorrPawnWeight = "CorrPawnWeight", 128, 0, 256, 13;
-    CorrNonPawnWeight = "CorrNonPawnWeight", 64, 0, 256, 13;
+    CorrPawnWeight = "CorrPawnWeight", 123, 0, 256, 13;
+    CorrNonPawnWeight = "CorrNonPawnWeight", 104, 0, 256, 13;
     // Update: an entry moves toward the search's eval error (clamped to
     // +-CorrDiffClamp cp) by min(depth + 1, CorrUpdateCap) / 256; entries are
     // kept within +-CorrLimit cp.
-    CorrUpdateCap = "CorrUpdateCap", 16, 4, 64, 3;
-    CorrDiffClamp = "CorrDiffClamp", 400, 100, 1000, 45;
-    CorrLimit = "CorrLimit", 64, 16, 256, 12;
+    CorrUpdateCap = "CorrUpdateCap", 18, 4, 64, 3;
+    CorrDiffClamp = "CorrDiffClamp", 404, 100, 1000, 45;
+    CorrLimit = "CorrLimit", 57, 16, 256, 12;
     // Network output multiplier in percent, applied to every search eval. Lets a
     // net trained on differently scaled labels be run at Incipit's eval scale
     // (which the pruning margins and other cp thresholds are tuned to) without
