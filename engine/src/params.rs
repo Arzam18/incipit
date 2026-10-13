@@ -174,6 +174,7 @@ params! {
     UseLmr = "UseLmr", 1, 0, 1, 0;
     UseLmrCutNoTt = "UseLmrCutNoTt", 1, 0, 1, 0;
     UseLmrDeeper = "UseLmrDeeper", 1, 0, 1, 0;
+    UseTtPv = "UseTtPv", 1, 0, 1, 0;
     UseQsSee = "UseQsSee", 1, 0, 1, 0;
     UseQsEvasionLimit = "UseQsEvasionLimit", 1, 0, 1, 0;
     UseCorrHist = "UseCorrHist", 1, 0, 1, 0;
