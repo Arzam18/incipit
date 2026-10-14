@@ -1615,7 +1615,7 @@ impl Searcher {
                 && depth >= tp(P::SeDepth)
                 && m == tt_move
                 && excluded == 0
-                && tt_depth >= depth - 3
+                && tt_depth >= depth - tp(P::SeTtDepth)
                 && tt_bound != BOUND_UPPER
                 && tt_score.abs() < MATE_BOUND
                 && ply < 2 * self.root_depth as usize

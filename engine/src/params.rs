@@ -113,6 +113,9 @@ params! {
     SeeRook = "SeeRook", 514, 250, 1000, 37;
     SeeQueen = "SeeQueen", 951, 500, 2000, 75;
     SeDepth = "SeDepth", 6, 4, 10, 1;
+    // A TT entry qualifies its move for the singular test when its depth is
+    // at least the node's depth minus this. Start: 3, the value used so far.
+    SeTtDepth = "SeTtDepth", 3, 0, 6, 1;
     // Correction history. The eval correction is (CorrPawnWeight * pawn entry +
     // CorrNonPawnWeight * (white + black non-pawn entries)) / 128; the defaults are the
     // original 2:1:1 weighting, as separate weights so SPSA can move each one.
