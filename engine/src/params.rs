@@ -101,6 +101,11 @@ params! {
     FutDepth = "FutDepth", 9, 4, 12, 1;
     HistPruneDepth = "HistPruneDepth", 5, 2, 8, 1;
     SeeNoisyDepth = "SeeNoisyDepth", 7, 3, 10, 1;
+    // A capture whose static exchange gain is at least this (cp, half a pawn
+    // below zero) is ordered as a good capture, before the killers and quiets;
+    // the rest follow the quiets, and with staged generation the quiets are
+    // generated as soon as only those remain.
+    GoodCaptureSee = "GoodCaptureSee", -50, -150, 0, 8;
     // SEE piece values (pawn = 100), textbook starting values: used by SEE pruning,
     // ProbCut, qsearch SEE and capture ordering.
     SeeKnight = "SeeKnight", 313, 150, 650, 25;

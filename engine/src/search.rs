@@ -272,10 +272,6 @@ impl PonderTm {
 
 /// SEE piece values by piece type: the pawn is the unit (100) and the others are
 /// SPSA parameters, starting from textbook values; constants outside tune builds.
-/// A capture whose static exchange gain is at least this (cp, slightly
-/// below zero) is ordered as a good capture; losing captures follow the
-/// quiets.
-const GOOD_CAPTURE_SEE: i32 = -50;
 
 #[inline(always)]
 fn see_vals() -> [i32; 7] {
@@ -1594,9 +1590,9 @@ impl Searcher {
                 } else if on(P::UseSeeNoisy)
                     && depth <= tp(P::SeeNoisyDepth)
                     // A good capture (ordered so by its SEE against
-                    // GOOD_CAPTURE_SEE) passes any bar at or below that
+                    // GoodCaptureSee) passes any bar at or below that
                     // without another exchange evaluation.
-                    && (mscore < 0 || -tp(P::SeeNoisy) * depth > GOOD_CAPTURE_SEE)
+                    && (mscore < 0 || -tp(P::SeeNoisy) * depth > tp(P::GoodCaptureSee))
                     && !pos.see_ge(m, -tp(P::SeeNoisy) * depth, &see_vals())
                 {
                     self.stats.see_noisy += 1;
@@ -1916,7 +1912,7 @@ impl Searcher {
                     // pawn is nearly always at least as good, and a negative
                     // score lets them be reduced like losing captures.
                     -(1 << 29) + base
-                } else if pos.see_ge(m, GOOD_CAPTURE_SEE, &see_vals()) {
+                } else if pos.see_ge(m, tp(P::GoodCaptureSee), &see_vals()) {
                     (1 << 28) + base
                 } else {
                     -(1 << 28) + base
