@@ -1071,4 +1071,63 @@ mod tests {
             }
         }
     }
+
+    /// Every count in the perft suite up to a node budget (the deep entries are
+    /// left to `incipit perftsuite`), so move generation, including the Chess960
+    /// castles of the suite's last five positions, can't regress unnoticed.
+    #[test]
+    fn perft_suite_counts() {
+        crate::attacks::init();
+        let mut chess960 = 0;
+        for line in include_str!("../tests/perft.epd").lines() {
+            let mut parts = line.split(';');
+            let fen = parts.next().unwrap().trim();
+            let pos = Position::from_fen(fen).expect(fen);
+            let mut checked = 0;
+            for entry in parts {
+                let (d, exp) = entry.trim()[1..].split_once(' ').unwrap();
+                let exp: u64 = exp.trim().parse().unwrap();
+                if exp > 1_000_000 {
+                    continue;
+                }
+                assert_eq!(perft(&pos, d.parse().unwrap()), exp, "{fen} depth {d}");
+                checked += 1;
+            }
+            assert!(checked >= 3, "{fen}: too few depths under the budget");
+            let castling = fen.split(' ').nth(2).unwrap();
+            chess960 += castling.chars().any(|c| !"KQkq-".contains(c)) as usize;
+        }
+        assert!(chess960 >= 5, "the suite lost its Chess960 positions");
+    }
+
+    /// Every castle reached in random Chess960 games prints king-takes-rook
+    /// (the king's own destination could be a plain king move, or no move at
+    /// all when the king starts there) and parses back to the same move.
+    #[test]
+    fn chess960_castles_round_trip() {
+        crate::attacks::init();
+        let mut castles = 0;
+        let mut king_stays = 0;
+        for pos in random_positions(8, 40) {
+            let mut list = MoveList::new();
+            pos.gen_moves(&mut list, false);
+            for m in (0..list.len()).map(|i| list[i]).filter(|&m| is_castle(m)) {
+                let mut c = pos;
+                if !c.make_move(m) {
+                    continue;
+                }
+                let us = if mfrom(m) < 8 { WHITE } else { BLACK };
+                let rsq = pos.rook_sq[castle_right(us, mflag(m) == F_QCASTLE)] as usize;
+                let text = pos.move_uci(m);
+                if mfrom(m) != [4, 60][us] {
+                    assert_eq!(text, format!("{}{}", sq_str(mfrom(m)), sq_str(rsq)));
+                }
+                assert_eq!(pos.parse_move(&text), Some(m), "{text}");
+                castles += 1;
+                king_stays += (mfrom(m) == mto(m)) as usize;
+            }
+        }
+        assert!(castles >= 50, "only {castles} castles reached");
+        println!("{castles} castles, {king_stays} with the king staying put");
+    }
 }
