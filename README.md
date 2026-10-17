@@ -18,6 +18,8 @@ Language models doing the work were almost certainly trained on much of that sam
 
 **License:** Incipit is open-source and licensed under GPLv3 (or later).
 
+**NNUE Training Data:** Incipit's training data is all fully self-generated, freely-available](https://huggingface.co/datasets/adamtwiss/incipit-data) and openly licensed under a Creative Commons license (with attribution).
+
 ## Credits
 
 Incipit is built, tested and trained with these tools:
