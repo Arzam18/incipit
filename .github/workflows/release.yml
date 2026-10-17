@@ -14,7 +14,8 @@ name: release
 
 on:
   push:
-    tags: ['v*']
+    # Version tags only (v0.5.0): net-hosting tags must never start a release.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
 
 permissions:
@@ -44,7 +45,7 @@ jobs:
         working-directory: engine
         run: |
           net="$PWD/$(basename "$(cat net.txt)")"
-          ver=$(git describe --tags --always)
+          ver=$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --always)
           mkdir -p ../dist
           for target in x86_64-unknown-linux-gnu x86_64-pc-windows-gnu; do
             if [ $target = x86_64-pc-windows-gnu ]; then cc=x86_64-w64-mingw32-gcc; os=windows; ext=.exe
@@ -57,6 +58,8 @@ jobs:
             EVALFILE="$net" RUSTFLAGS="-Ctarget-feature=+crt-static" \
             cargo build --release --target aarch64-unknown-linux-gnu
           cp target/aarch64-unknown-linux-gnu/release/incipit ../dist/incipit-$ver-linux-aarch64
+          # The embedded net, attached to the release for anyone building from source.
+          cp "$net" ../dist/
           ls -l ../dist
 
       - name: Check Linux builds
@@ -115,7 +118,7 @@ jobs:
         working-directory: engine
         run: |
           net="$PWD/$(basename "$(cat net.txt)")"
-          ver=$(git describe --tags --always)
+          ver=$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --always)
           EVALFILE="$net" RUSTFLAGS="-Ctarget-cpu=apple-m1" cargo build --release --target aarch64-apple-darwin
           EVALFILE="$net" RUSTFLAGS="-Ctarget-cpu=x86-64-v3" cargo build --release --target x86_64-apple-darwin
           mkdir -p ../dist
@@ -170,6 +173,8 @@ jobs:
           pattern: incipit*
           merge-multiple: true
           path: dist
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
       - name: Draft release
         env:
           GH_TOKEN: ${{ github.token }}
