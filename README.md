@@ -14,11 +14,67 @@ Language models doing the work were almost certainly trained on much of that sam
 
 **The name:** The Coda name was an acronym, but in music, a *coda* is also the closing passage of a piece, and an *incipit* is its opening. The name reflects that Incipit starts afresh, from nothing.
 
-**Status:** Incipit is an experiment (it may fail, it may become a full-blown engine). Development is being done in the open and this repo is public; however, it isn't yet intended for external testing. Don't expect much in the way of strength until there's a sufficient volume of quality training data to support larger models.
+**Status:** Incipit is an experiment that is still developing quickly. Version 0.5.0 is its first public release, for testers and rating lists. Expect regular releases as its search improves and its networks grow with more self-play data.
 
 **License:** Incipit is open-source and licensed under GPLv3 (or later).
 
 **NNUE Training Data:** Incipit's training data is all fully self-generated, [freely-available](https://huggingface.co/datasets/adamtwiss/incipit-data) and openly licensed under a Creative Commons license (with attribution).
+
+## Download
+
+Prebuilt binaries are attached to each [release](https://github.com/adamtwiss/incipit/releases), with the network embedded:
+
+| File | Platform |
+|---|---|
+| `incipit-vX.Y.Z-linux-x86-64` | Linux, x86-64 |
+| `incipit-vX.Y.Z-windows-x86-64.exe` | Windows, x86-64 |
+| `incipit-vX.Y.Z-macos-universal` | macOS, Apple Silicon and Intel |
+| `incipit-vX.Y.Z-linux-aarch64` | Linux, 64-bit ARM |
+
+The x86-64 builds need AVX2 and BMI2 (Intel Haswell or AMD Zen 1 and later). Faster code paths (AVX-512, VNNI, PEXT) are chosen at start-up when the CPU has them; `incipit bench` prints what was chosen.
+
+## Features
+
+* **Evaluation:** an NNUE network trained only on Incipit's own self-play games (about 15 billion positions so far, published as the [incipit-data](https://huggingface.co/datasets/adamtwiss/incipit-data) dataset). Its shape: 32 king buckets (mirrored), a 1024-wide feature transformer with pairwise activation, hidden layers of 16 and 16, and 8 output buckets by material.
+* **Search:** alpha-beta (principal variation search) with the usual selectivity (null-move pruning, late-move reductions, singular extensions and more), a transposition table, and Lazy SMP for multiple threads.
+* **Endgame tablebases:** Syzygy, via Fathom.
+* **Chess960** (and double Fischer random).
+* **Pondering**, and win/draw/loss output (`UCI_ShowWDL`).
+* **Normalised scores:** a reported score of +100 means about a 50% chance of winning, whatever the material. Mate and tablebase scores are reported as usual.
+
+## UCI options
+
+| Option | Default | |
+|---|---|---|
+| `Hash` | 16 | Transposition table size in MB (1-65536). |
+| `Threads` | 1 | Search threads (1-256). |
+| `MoveOverhead` | 20 | Milliseconds reserved per move for communication lag (0-5000). `Move Overhead` is accepted too. |
+| `Ponder` | false | Allow pondering. |
+| `UCI_Chess960` | false | Chess960 castling notation (king takes rook). |
+| `UCI_ShowWDL` | false | Add win/draw/loss estimates (per mille) to `info` lines. |
+| `NormalizeScore` | true | Report scores on the 100 = 50% winning-chance scale; false gives the network's raw scale. |
+| `SyzygyPath` | (empty) | Directories of Syzygy tablebase files, separated by `:` (`;` on Windows). |
+| `EvalCacheKB` | 256 | Size of the per-thread evaluation cache in KB. |
+| `MoveReserve` | 0 | In sudden-death games, keep time back for this many further moves (useful for online play with network lag). |
+| `TmLog` | false | Developer option: print a time-management summary after each search. |
+
+## Command line
+
+* `incipit bench [depth]`: searches a fixed set of positions and prints the node count and speed.
+* `incipit epd <file> [nodes N | movetime MS | depth D] [hash MB] [threads T] [perft D] [verbose]`: runs an EPD test suite. It understands `bm`, `am`, `dm` (mate in N) and `Dn` (perft counts). It reports the positions solved and the depth at which each answer was found.
+
+The other commands (`datagen`, `genfens`, `l1perm`, `l1stats`, `l1check`, `nnuecheck`, `tune-spec`) are development tools.
+
+## Building
+
+You need Rust (1.78 or later; 1.89 or later for the AVX-512 code and 1.98 or later for the ARM dot-product code) and a C compiler for Fathom.
+
+```
+cd engine
+make          # downloads the network named in net.txt, then builds ./incipit for this machine
+```
+
+`make net` only downloads the network. To build by hand: `EVALFILE=/path/to/net.nnue cargo build --release`.
 
 ## Credits
 

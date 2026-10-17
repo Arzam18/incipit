@@ -15,6 +15,7 @@ data/
 
 # Engine binaries built by make, and partial net downloads
 /engine/incipit
+/engine/incipit.rr
 /engine/incipit.exe
 *.tmp
 
