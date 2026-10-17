@@ -111,8 +111,16 @@ pub fn parse_line(line: &str) -> Result<Option<Entry>, String> {
     };
     let mut e = Entry { fen, ..Default::default() };
     // Move operands without check or quality marks written apart ("Qd1 +").
+    // A promotion written apart ("f8 = Q", "f8 =Q", "f8= Q") is joined again.
     let moves = |args: &[String]| -> Vec<String> {
-        args.iter().filter(|a| !a.chars().all(|c| matches!(c, '+' | '#' | '!' | '?'))).cloned().collect()
+        let mut v: Vec<String> = Vec::new();
+        for a in args.iter().filter(|a| !a.chars().all(|c| matches!(c, '+' | '#' | '!' | '?'))) {
+            match v.last_mut() {
+                Some(last) if last.ends_with('=') || a.starts_with('=') => last.push_str(a),
+                _ => v.push(a.clone()),
+            }
+        }
+        v
     };
     for op in ops {
         let (name, args) = (op[0].as_str(), &op[1..]);
@@ -179,6 +187,32 @@ pub fn resolve_loose(pos: &Position, tok: &str) -> Vec<Move> {
     legal.iter().zip(&sans).filter(|(_, s)| piece_dest(s).as_ref() == Some(&want)).map(|(&m, _)| m).collect()
 }
 
+/// Why Position::from_fen refused a position, for the report: the checks it
+/// makes on a parsable board, else a malformed FEN.
+fn why_rejected(fen: &str) -> &'static str {
+    let f: Vec<&str> = fen.split_whitespace().collect();
+    let board = f[0];
+    let ranks: Vec<&str> = board.split('/').collect();
+    let well_formed = ranks.len() == 8
+        && ranks.iter().all(|r| {
+            r.chars().map(|c| if c.is_ascii_digit() { c as usize - '0' as usize } else { 1 }).sum::<usize>() == 8
+                && r.chars().all(|c| c.is_ascii_digit() || "pnbrqkPNBRQK".contains(c))
+        });
+    if !well_formed || !matches!(f[1], "w" | "b") {
+        return "malformed FEN:";
+    }
+    let count = |set: &str| board.chars().filter(|&c| set.contains(c)).count();
+    if count("K") != 1 || count("k") != 1 {
+        "not one king a side:"
+    } else if count("PNBRQK") > 16 || count("pnbrqk") > 16 {
+        "more than 16 pieces a side (impossible in a game; the net's material buckets stop at 32):"
+    } else if ranks[0].contains(['p', 'P']) || ranks[7].contains(['p', 'P']) {
+        "pawn on a back rank:"
+    } else {
+        "side not to move is in check:"
+    }
+}
+
 pub enum Limit {
     Nodes(u64),
     Ms(u64),
@@ -243,7 +277,7 @@ pub fn run(path: &str, limit: Limit, hash_mb: usize, threads: usize, perft_max: 
         };
         let name = if e.id.is_empty() { format!("line {}", ln) } else { e.id.clone() };
         let Some(pos) = Position::from_fen(&e.fen) else {
-            println!("{}: skipped: invalid or impossible position {}", name, e.fen);
+            println!("{}: skipped: {} {}", name, why_rejected(&e.fen), e.fen);
             skipped += 1;
             continue;
         };
@@ -386,6 +420,8 @@ mod tests {
         let e = parse_line("8/8/8/8/8/8/8/K6k w - -  0 1; D1 3 ;D2 9; c0 \"a; b\"; id \"x;y\"").unwrap().unwrap();
         assert_eq!((e.perft, e.id), (vec![(1, 3), (2, 9)], "x;y".to_string()));
         // An avoid move with its marks written apart.
+        let e = parse_line("8/5P2/8/8/8/8/8/K6k w - -; bm f8 = Q; c1 diff=7").unwrap().unwrap();
+        assert_eq!(e.bm, vec!["f8=Q".to_string()]);
         let e = parse_line("2k5/8/8/8/8/8/8/K1N5 w - -; am Nb3 + ? ; c1 diff=10").unwrap().unwrap();
         assert_eq!(e.am, vec!["Nb3".to_string()]);
         assert_eq!(parse_line("   "), Ok(None));
@@ -410,6 +446,17 @@ mod tests {
         assert_eq!(both, vec!["c6e5", "g4e5"]);
         assert_eq!(resolve_loose(&pos, "Nce5").len(), 1);
         assert_eq!(resolve_loose(&pos, "Bxe5"), vec![]);
+    }
+
+    #[test]
+    fn rejected_positions_say_why() {
+        let w = |fen: &str| why_rejected(fen).split(' ').next().unwrap();
+        assert_eq!(w("k7/1p1p1p1p/pPpPpPpP/P1P1P1P1/1B1B1B1B/B1B1B1B1/1B1B1B1B/K1B1B1B1 w - -"), "more");
+        assert_eq!(w("rnbqkbnr/pppp1ppp/8/8/8/8/PPPPPPPP/RNBQKBNR K KQkq -"), "malformed");
+        assert_eq!(w("rnbqk0nr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -"), "malformed");
+        assert_eq!(w("rnbq1bnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -"), "not");
+        assert_eq!(w("P6k/8/8/8/8/8/8/K7 w - -"), "pawn");
+        assert_eq!(w("k7/8/8/8/8/8/8/K6R w - -"), "side");
     }
 
     #[test]
