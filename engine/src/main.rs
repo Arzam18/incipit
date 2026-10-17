@@ -350,11 +350,24 @@ fn main() {
                 return;
             }
             "epd" if args.len() >= 3 => {
-                // epd <file> [nodes N | movetime MS | depth D] [hash MB] [threads T] [perft D] [verbose]
+                // epd <file> [nodes N | movetime MS | depth D] [hash MB] [threads T] [perft D] [verbose] [Param=value ...]
                 let mut limit = epd::Limit::Nodes(1_000_000);
                 let (mut hash, mut threads, mut perft_max, mut verbose) = (64, 1, 5, false);
                 let mut i = 3;
                 while i < args.len() {
+                    // Param=value, as for bench (tune builds only): e.g. UseSeeNoisy=0.
+                    if let Some((k, v)) = args[i].split_once('=') {
+                        if !cfg!(feature = "tune") {
+                            eprintln!("{}: search parameters are constants in this build; build with --features tune (make TUNE=1)", args[i]);
+                            std::process::exit(1);
+                        }
+                        if !v.parse().is_ok_and(|v| params::set(k, v)) {
+                            eprintln!("unknown parameter {}", args[i]);
+                            std::process::exit(1);
+                        }
+                        i += 1;
+                        continue;
+                    }
                     let val = args.get(i + 1).and_then(|v| v.parse::<u64>().ok());
                     match (args[i].as_str(), val) {
                         ("nodes", Some(v)) => limit = epd::Limit::Nodes(v),
@@ -370,7 +383,7 @@ fn main() {
                         }
                         _ => {
                             eprintln!(
-                                "usage: incipit epd <file> [nodes N | movetime MS | depth D] [hash MB] [threads T] [perft D] [verbose]"
+                                "usage: incipit epd <file> [nodes N | movetime MS | depth D] [hash MB] [threads T] [perft D] [verbose] [Param=value ...]"
                             );
                             std::process::exit(2);
                         }
