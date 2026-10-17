@@ -432,12 +432,31 @@ pub static SHOW_WDL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// decision (budget, final target, why it stopped), for time-use analysis.
 pub static TM_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Incipit's WDL model (datatools wdlfit on 150M positions of c19-c22,
-/// 2026-10-05): P(win) = 1/(1+exp((a-x)/b)), P(loss) = 1/(1+exp((a+x)/b)),
-/// a and b cubic in m = clamp(material, 17, 78) / 58 (1/3/3/5/9 over both
-/// sides), x the score in our cp units.
-const WDL_A: [f64; 4] = [-34.395460, 179.411649, -340.422392, 376.065278];
-const WDL_B: [f64; 4] = [161.627807, -447.755780, 467.867011, -24.333415];
+/// NormalizeScore: print centipawn scores so that 100 means a 50% chance of
+/// winning (the WDL model's `a` at the position's material), instead of the
+/// net's own scale, on which a 50% win is about 165 (full board) to 300
+/// (few pieces). Output only: search, mate and tablebase scores are
+/// untouched. Datagen turns it off, since its labels are the printed scores.
+pub static NORMALIZE_SCORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Incipit's WDL model (datatools wdlfit on c39: 4M games, 8000 nodes a move,
+/// played by 5671B3D5, fitted 2026-10-17): P(win) = 1/(1+exp((a-x)/b)),
+/// P(loss) = 1/(1+exp((a+x)/b)), a and b cubic in m = clamp(material, 17, 78)
+/// / 58 (1/3/3/5/9 over both sides), x the score in the net's cp units.
+/// Refit when a promoted net's eval scale moves (calib.py fits every set).
+const WDL_A: [f64; 4] = [-71.305398, 241.467715, -349.815456, 379.913116];
+const WDL_B: [f64; 4] = [93.558964, -250.230715, 286.547794, 23.697445];
+
+/// The WDL model's a and b at the position's material.
+fn wdl_ab(pos: &Position) -> (f64, f64) {
+    let mat: u32 = [(PAWN, 1), (KNIGHT, 3), (BISHOP, 3), (ROOK, 5), (QUEEN, 9)]
+        .iter()
+        .map(|&(pt, v)| v * pos.pieces[pt].count_ones())
+        .sum();
+    let m = (mat as f64).clamp(17.0, 78.0) / 58.0;
+    let poly = |c: &[f64; 4]| ((c[0] * m + c[1]) * m + c[2]) * m + c[3];
+    (poly(&WDL_A), poly(&WDL_B))
+}
 
 /// " wdl W D L" (permille, side to move, summing to 1000) when UCI_ShowWDL is
 /// on, else "".
@@ -452,13 +471,7 @@ fn wdl_str(s: i32, pos: &Position) -> String {
             (0, 1000)
         }
     } else {
-        let mat: u32 = [(PAWN, 1), (KNIGHT, 3), (BISHOP, 3), (ROOK, 5), (QUEEN, 9)]
-            .iter()
-            .map(|&(pt, v)| v * pos.pieces[pt].count_ones())
-            .sum();
-        let m = (mat as f64).clamp(17.0, 78.0) / 58.0;
-        let poly = |c: &[f64; 4]| ((c[0] * m + c[1]) * m + c[2]) * m + c[3];
-        let (a, b) = (poly(&WDL_A), poly(&WDL_B));
+        let (a, b) = wdl_ab(pos);
         let x = s as f64;
         let w = 1000.0 / (1.0 + ((a - x) / b).exp());
         let l = 1000.0 / (1.0 + ((a + x) / b).exp());
@@ -467,7 +480,16 @@ fn wdl_str(s: i32, pos: &Position) -> String {
     format!(" wdl {} {} {}", w, (1000 - w - l).max(0), l)
 }
 
-pub(crate) fn score_str(s: i32) -> String {
+/// A score as printed: "mate N", a tablebase result as a large cp value, or
+/// cp, normalised (NormalizeScore) so 100 is a 50% chance of winning in `pos`.
+pub(crate) fn score_str(s: i32, pos: &Position) -> String {
+    if s.abs() < MATE_BOUND && NORMALIZE_SCORE.load(std::sync::atomic::Ordering::Relaxed) {
+        return format!("cp {}", (s as f64 * 100.0 / wdl_ab(pos).0).round() as i32);
+    }
+    score_str_raw(s)
+}
+
+fn score_str_raw(s: i32) -> String {
     if s >= MATE - MAX_PLY as i32 {
         format!("mate {}", (MATE - s + 1) / 2)
     } else if s <= -(MATE - MAX_PLY as i32) {
@@ -933,7 +955,7 @@ impl Searcher {
                     };
                     println!(
                         "info depth 1 score {}{} nodes 0 tbhits 1 time 0 pv {}",
-                        score_str(s),
+                        score_str(s, root),
                         wdl,
                         root.move_uci(m)
                     );
@@ -1020,9 +1042,9 @@ impl Searcher {
                 }
                 if !self.silent && best != reported {
                     let sc = if best == fh_move {
-                        format!("{} lowerbound{}", score_str(fh_score), wdl_str(fh_score, root))
+                        format!("{} lowerbound{}", score_str(fh_score, root), wdl_str(fh_score, root))
                     } else {
-                        format!("{}{}", score_str(score), wdl_str(score, root))
+                        format!("{}{}", score_str(score, root), wdl_str(score, root))
                     };
                     let el = self.elapsed_ms();
                     println!(
@@ -1168,7 +1190,7 @@ impl Searcher {
             "info depth {} seldepth {} score {}{} nodes {} nps {} hashfull {} tbhits {} time {} pv{}",
             d,
             seldepth,
-            score_str(score),
+            score_str(score, &self.root_pos),
             wdl_str(score, &self.root_pos),
             nodes,
             nps,
@@ -2154,5 +2176,29 @@ impl Searcher {
         }
         self.tt.store(pos.hash, best_move, ss, raw_eval, 0, bound, pv_node || tte.is_some_and(|e| e.pv));
         best
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Printed scores: 100 at the WDL model's 50%-win score, scaled in
+    /// proportion, sign kept; mate and tablebase scores as before.
+    #[test]
+    fn normalised_scores() {
+        crate::attacks::init();
+        let pos = Position::from_fen("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+        let a = wdl_ab(&pos).0;
+        assert!((150.0..200.0).contains(&a), "a {a}");
+        assert_eq!(score_str(a.round() as i32, &pos), "cp 100");
+        assert_eq!(score_str(-(a.round() as i32), &pos), "cp -100");
+        assert_eq!(score_str(0, &pos), "cp 0");
+        // An endgame needs a larger raw score for the same 50%.
+        let end = Position::from_fen("8/5pk1/6p1/8/8/6P1/5PK1/3R4 w - - 0 40").unwrap();
+        assert!(wdl_ab(&end).0 > a + 50.0);
+        for s in [MATE - 3, -(MATE - 4), TB_WIN - 10, -(TB_WIN - 10)] {
+            assert_eq!(score_str(s, &pos), score_str_raw(s));
+        }
     }
 }

@@ -352,7 +352,7 @@ pub fn run(path: &str, limit: Limit, hash_mb: usize, threads: usize, perft_max: 
         if let Some(n) = e.dm {
             want.push(format!("dm {}", n));
         }
-        let got = format!("{} ({})", san(&pos, m, &legal), score_str(sc));
+        let got = format!("{} ({})", san(&pos, m, &legal), score_str(sc, &pos));
         if good(m, sc) {
             solved += 1;
             // The first iteration of the final run of iterations that all
