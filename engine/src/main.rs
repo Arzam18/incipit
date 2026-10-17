@@ -181,9 +181,17 @@ impl Uci {
         let mut ponder = false;
         let mut infinite = false;
         let mut search_moves = Vec::new();
+        // A clock keyword whose value doesn't parse: move at once rather than
+        // search without a limit.
+        let mut bad_clock = false;
         let mut i = 1;
         while i < toks.len() {
-            let v = toks.get(i + 1).and_then(|s| s.parse::<i64>().ok());
+            // Integers, or decimals (truncated) from GUIs that send them.
+            let v =
+                toks.get(i + 1).and_then(|s| s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64)));
+            if v.is_none() && matches!(toks[i], "wtime" | "btime" | "movetime") {
+                bad_clock = true;
+            }
             match toks[i] {
                 // searchmoves <move> ...: every following token that is a
                 // legal move here (it ends at the next keyword).
@@ -219,21 +227,26 @@ impl Uci {
         let (time, inc) = if self.pos.stm == WHITE { (wtime, winc) } else { (btime, binc) };
         // Our clock missing (or unparsable) but the other side's given: use
         // theirs rather than searching without a limit.
-        let time = time.or(wtime).or(btime);
+        let time = time.or(wtime).or(btime).or(if bad_clock && movetime.is_none() { Some(0) } else { None });
         let mut lim = Limits { soft_ms: None, hard_ms: None, depth, nodes };
         let mut base_soft = 0u64;
         let t0 = search::now_ms();
         if let Some(mt) = movetime {
-            lim.hard_ms = Some((mt - self.overhead).max(1) as u64);
+            lim.hard_ms = Some(mt.saturating_sub(self.overhead).max(1) as u64);
         } else if let Some(t) = time {
-            let left = (t - self.overhead).max(1);
+            // Saturating arithmetic: absurd clock values must not wrap.
+            let left = t.saturating_sub(self.overhead).max(1);
             // MoveReserve is for sudden death only (no movestogo).
-            let left =
-                if mtg == 0 && inc < self.overhead { (left - self.overhead * self.reserve_moves).max(1) } else { left };
-            let soft = if mtg > 0 {
-                left / (mtg + 1).min(40) + inc * 3 / 4
+            let left = if mtg == 0 && inc < self.overhead {
+                left.saturating_sub(self.overhead.saturating_mul(self.reserve_moves)).max(1)
             } else {
-                left / params::tp(params::P::TmSoftDiv) as i64 + inc * params::tp(params::P::TmIncPct) as i64 / 100
+                left
+            };
+            let soft = if mtg > 0 {
+                (left / mtg.saturating_add(1).min(40)).saturating_add(inc.saturating_mul(3) / 4)
+            } else {
+                (left / params::tp(params::P::TmSoftDiv) as i64)
+                    .saturating_add(inc.saturating_mul(params::tp(params::P::TmIncPct) as i64) / 100)
             };
             base_soft = soft.max(1) as u64;
             let soft = (soft as f64 * self.searcher.pt.feed_scale()) as i64;
@@ -244,8 +257,10 @@ impl Uci {
             // the soft target (left / 2 at movestogo 1) exceeded the cap, and
             // the last move before the control was always cut mid-iteration.
             let hard_num = if (1..=3).contains(&mtg) { 12 - 2 * (mtg - 1) } else { 6 };
-            let hard = (left * hard_num / 15).min(soft * params::tp(params::P::TmHardMul) as i64).max(1);
-            let soft = soft.min(hard);
+            let hard = (left.saturating_mul(hard_num) / 15)
+                .min(soft.saturating_mul(params::tp(params::P::TmHardMul) as i64))
+                .max(1);
+            let soft = soft.min(hard).max(1);
             lim.soft_ms = Some(soft as u64);
             lim.hard_ms = Some(hard as u64);
         }
