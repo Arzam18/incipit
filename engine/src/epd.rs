@@ -365,7 +365,13 @@ pub fn run(path: &str, limit: Limit, hash_mb: usize, threads: usize, perft_max: 
             println!("ok    {}: {} -> {}, {}", name, want.join(", "), got, found);
         } else {
             let depth = log.last().map_or(0, |r| r.depth);
-            println!("FAIL  {}: {} -> {}, depth {}, {} nodes", name, want.join(", "), got, depth, short(nodes));
+            // A mate position whose move was right but whose mate wasn't proven.
+            let note = if e.dm.is_some() && !bm.is_empty() && bm.contains(&m) && !am.contains(&m) {
+                " (right move, mate not proven)"
+            } else {
+                ""
+            };
+            println!("FAIL  {}: {} -> {}, depth {}, {} nodes{}", name, want.join(", "), got, depth, short(nodes), note);
             failed.push(name);
         }
     }
