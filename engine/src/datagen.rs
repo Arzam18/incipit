@@ -258,10 +258,16 @@ pub fn genfens(toks: &[&str]) {
         _ if dfrc => Vec::new(),
         None => vec![Position::from_fen(START_FEN).unwrap()],
         Some(path) => {
-            let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
-                eprintln!("genfens: cannot read book {}: {}", path, e);
-                std::process::exit(1);
-            });
+            // Errors go to stderr only (an `info string genfens` line would be
+            // read as an opening) and return: inside the UCI loop, exiting would
+            // end the engine.
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("genfens: cannot read book {}: {}", path, e);
+                    return;
+                }
+            };
             // EPD: first four fields are the position; any operations after them are ignored.
             let book: Vec<Position> = text
                 .lines()
@@ -276,7 +282,7 @@ pub fn genfens(toks: &[&str]) {
                 .collect();
             if book.is_empty() {
                 eprintln!("genfens: no positions in book {}", path);
-                std::process::exit(1);
+                return;
             }
             book
         }

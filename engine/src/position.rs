@@ -42,7 +42,6 @@ pub fn mto(m: Move) -> usize {
 pub fn mflag(m: Move) -> u16 {
     m >> 12
 }
-#[allow(dead_code)]
 #[inline(always)]
 pub fn is_capture(m: Move) -> bool {
     mflag(m) & 4 != 0
@@ -1073,7 +1072,7 @@ mod tests {
     }
 
     /// Every count in the perft suite up to a node budget (the deep entries are
-    /// left to `incipit perftsuite`), so move generation, including the Chess960
+    /// left to `incipit epd tests/perft.epd perft 6`), so move generation, including the Chess960
     /// castles of the suite's last five positions, can't regress unnoticed.
     #[test]
     fn perft_suite_counts() {

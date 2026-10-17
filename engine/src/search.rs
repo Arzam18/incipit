@@ -272,7 +272,6 @@ impl PonderTm {
 
 /// SEE piece values by piece type: the pawn is the unit (100) and the others are
 /// SPSA parameters, starting from textbook values; constants outside tune builds.
-
 #[inline(always)]
 fn see_vals() -> [i32; 7] {
     [100, tp(P::SeeKnight), tp(P::SeeBishop), tp(P::SeeRook), tp(P::SeeQueen), 20000, 0]

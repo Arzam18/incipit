@@ -17,11 +17,11 @@
 # Configuration
 EXE := incipit
 NET_URL := $(strip $(shell cat net.txt 2>/dev/null))
-# EVALFILE: defaults to the filename from net.txt (e.g. net-E4722BA0.nnue).
+# EVALFILE: defaults to the filename from net.txt (net-XXXXXXXX.nnue).
 # OpenBench overrides this with an absolute path to the network file.
 EVALFILE := $(if $(NET_URL),$(notdir $(NET_URL)),net.nnue)
 # Repo and release tag, parsed from https://github.com/OWNER/REPO/releases/download/TAG/FILE
-# (used by the GitHub CLI fallback while the repo is private).
+# (used by the GitHub CLI fallback when a direct download fails).
 NET_REPO := $(word 3,$(subst /, ,$(NET_URL)))/$(word 4,$(subst /, ,$(NET_URL)))
 NET_TAG := $(word 7,$(subst /, ,$(NET_URL)))
 # Cargo.lock version 4 needs cargo 1.78.
@@ -85,10 +85,10 @@ net:
 		echo "Downloading NNUE net from $(NET_URL)..."; \
 		if ! curl -fsSL --retry 3 --retry-delay 2 "$(NET_URL)" -o "$$tmp"; then \
 			if command -v gh >/dev/null 2>&1; then \
-				echo "Direct download failed; trying the GitHub CLI (private repo)..."; \
+				echo "Direct download failed; trying the GitHub CLI..."; \
 				gh release download "$(NET_TAG)" -R "$(NET_REPO)" -p "$(notdir $(NET_URL))" -O "$$tmp" --clobber; \
 			else \
-				echo "Error: download failed. If the repo is private, install the GitHub CLI and run 'gh auth login', or copy the net here as $(EVALFILE)"; \
+				echo "Error: download failed. Check your connection, or download $(NET_URL) by hand and save it here as $(EVALFILE)"; \
 				exit 1; \
 			fi; \
 		fi; \

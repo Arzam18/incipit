@@ -85,32 +85,6 @@ const BENCH_FENS: [&str; 50] = [
     "8/8/p3k3/1p2p1P1/4K3/P3P3/8/8 b - - 0 63",
 ];
 
-fn perft_suite(path: &str, maxd: usize) {
-    let text = std::fs::read_to_string(path).unwrap();
-    let t = Instant::now();
-    let mut fails = 0;
-    let mut total = 0u64;
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split(';').collect();
-        let pos = Position::from_fen(parts[0].trim()).unwrap();
-        for p in &parts[1..] {
-            let p = p.trim();
-            let d: usize = p[1..p.find(' ').unwrap()].parse().unwrap();
-            let exp: u64 = p[p.find(' ').unwrap() + 1..].trim().parse().unwrap();
-            if d > maxd {
-                continue;
-            }
-            let n = perft(&pos, d as u32);
-            total += n;
-            if n != exp {
-                fails += 1;
-                println!("FAIL {} d{} got {} exp {}", parts[0], d, n, exp);
-            }
-        }
-    }
-    println!("done fails={} nodes={} time={:?}", fails, total, t.elapsed());
-}
-
 fn bench(depth: i32, eval_cache_kb: usize) {
     let mut s = Searcher::new(16, Arc::new(AtomicBool::new(false)));
     let _ = s.set_eval_cache_kb(eval_cache_kb);
@@ -393,10 +367,6 @@ fn main() {
                 let sum = epd::run(&args[2], limit, hash, threads, perft_max, verbose);
                 std::process::exit(if sum.perft_bad > 0 { 1 } else { 0 });
             }
-            "perftsuite" => {
-                perft_suite(&args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5));
-                return;
-            }
             "datagen" => {
                 // datagen <threads> <prefix> <nodes> <seconds> [seed]
                 let num = |i: usize| args.get(i).and_then(|s| s.parse::<u64>().ok());
@@ -499,7 +469,11 @@ fn main() {
                             eprintln!("unknown parameter {a}");
                             std::process::exit(1);
                         }
-                    } else if let Ok(d) = a.parse() {
+                    } else if let Ok(d) = a.parse::<i32>() {
+                        if d < 1 {
+                            eprintln!("bench: depth must be at least 1");
+                            std::process::exit(1);
+                        }
                         depth = d;
                     } else {
                         // A parameter without a value would otherwise be skipped
@@ -510,6 +484,18 @@ fn main() {
                 }
                 bench(depth, eval_cache_kb);
                 return;
+            }
+            // Known commands without enough arguments: a usage line, not UCI mode.
+            "epd" | "l1perm" | "l1stats" => {
+                eprintln!(
+                    "usage: {}",
+                    match args[1].as_str() {
+                        "epd" => "incipit epd <file> [nodes N | movetime MS | depth D] [hash MB] [threads T] [perft D] [verbose] [Param=value ...]",
+                        "l1perm" => "incipit l1perm <net.nnue> <fens.txt> <perm out>",
+                        _ => "incipit l1stats <net.nnue> <fens.txt>",
+                    }
+                );
+                std::process::exit(2);
             }
             _ => {}
         }
@@ -693,7 +679,8 @@ fn main() {
                         "uci_chess960" => {
                             CHESS960.store(val.eq_ignore_ascii_case("true"), Ordering::Relaxed);
                         }
-                        "moveoverhead" => {
+                        // "Move Overhead" (with a space) is the spelling many testers send.
+                        "moveoverhead" | "move overhead" => {
                             if let Ok(v) = val.parse::<i64>() {
                                 uci.overhead = v.clamp(0, 5000);
                             }

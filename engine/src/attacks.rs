@@ -14,7 +14,6 @@ pub static mut KNIGHT: [u64; 64] = [0; 64];
 pub static mut KING: [u64; 64] = [0; 64];
 pub static mut PAWN_ATT: [[u64; 64]; 2] = [[0; 64]; 2];
 pub static mut BETWEEN: [[u64; 64]; 64] = [[0; 64]; 64];
-pub static mut LINE: [[u64; 64]; 64] = [[0; 64]; 64];
 static mut R_MASK: [u64; 64] = [0; 64];
 static mut B_MASK: [u64; 64] = [0; 64];
 static mut R_OFF: [usize; 64] = [0; 64];
@@ -340,10 +339,8 @@ fn init_tables() {
                 let ba = 1u64 << b;
                 if slide(a, 0, &ROOK_DIRS) & ba != 0 {
                     BETWEEN[a][b] = slide(a, ba, &ROOK_DIRS) & slide(b, 1u64 << a, &ROOK_DIRS);
-                    LINE[a][b] = (slide(a, 0, &ROOK_DIRS) & slide(b, 0, &ROOK_DIRS)) | (1u64 << a) | ba;
                 } else if slide(a, 0, &BISHOP_DIRS) & ba != 0 {
                     BETWEEN[a][b] = slide(a, ba, &BISHOP_DIRS) & slide(b, 1u64 << a, &BISHOP_DIRS);
-                    LINE[a][b] = (slide(a, 0, &BISHOP_DIRS) & slide(b, 0, &BISHOP_DIRS)) | (1u64 << a) | ba;
                 }
             }
         }
@@ -391,15 +388,9 @@ pub fn king_attacks(sq: usize) -> u64 {
 pub fn pawn_attacks(c: usize, sq: usize) -> u64 {
     unsafe { PAWN_ATT[c][sq] }
 }
-#[allow(dead_code)]
 #[inline(always)]
 pub fn between(a: usize, b: usize) -> u64 {
     unsafe { BETWEEN[a][b] }
-}
-#[allow(dead_code)]
-#[inline(always)]
-pub fn line(a: usize, b: usize) -> u64 {
-    unsafe { LINE[a][b] }
 }
 #[inline(always)]
 pub fn zob_piece(pc: usize, sq: usize) -> u64 {

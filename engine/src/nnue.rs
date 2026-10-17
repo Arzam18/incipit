@@ -526,8 +526,7 @@ fn load_hidden(
     };
     let b1 = rows(f32s(nb1 * ln));
     let (mut wm, mut bm, mut wo) = (Vec::new(), Vec::new(), Vec::new());
-    let w2;
-    if n2 > 0 {
+    let w2 = if n2 > 0 {
         let wmf = f32s(buckets * n2 * in2);
         let bmf = f32s(buckets * n2);
         let wof = f32s(buckets * n2);
@@ -545,10 +544,10 @@ fn load_hidden(
             bm.push(mb);
             wo.push(ow);
         }
-        w2 = vec![[0f32; L1_SIZE]; buckets];
+        vec![[0f32; L1_SIZE]; buckets]
     } else {
-        w2 = rows(f32s(buckets * ln));
-    }
+        rows(f32s(buckets * ln))
+    };
     let b2 = f32s(buckets);
     let lin = if lin { rows(f32s(buckets * ln)) } else { vec![[0f32; L1_SIZE]; buckets] };
     Ok(Network {
@@ -2142,8 +2141,8 @@ pub fn l1check(trials: usize) -> usize {
 
 /// Hidden-layer diagnostics over a FEN file with the network in `path`: per
 /// output bucket and neuron, how often the neuron is active (pre-activation
-/// > 0) and saturated (>= 1), its bias, and the share of int8 weights at the
-/// clip. Replaces the embedded network for the rest of the process.
+/// above 0) and saturated (at least 1), its bias, and the share of int8
+/// weights at the clip. Replaces the embedded network for the rest of the process.
 pub fn l1stats(path: &str, fens: &str) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
     let n = load(&bytes)?;
