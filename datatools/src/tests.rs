@@ -104,8 +104,8 @@ fn san_roundtrips_for_every_legal_move() {
             continue;
         }
         for &m in &l {
-            let s = pgn::san(&pos, m, &l);
-            assert_eq!(pgn::find_san(&pos, &format!("{}+", s)), Some(m), "{} in {}", s, pos.to_fen());
+            let s = crate::san::san(&pos, m, &l);
+            assert_eq!(crate::san::find_san(&pos, &format!("{}+", s)), Some(m), "{} in {}", s, pos.to_fen());
         }
         pos.make_move(l[(rng.next() % l.len() as u64) as usize]);
     }
@@ -216,8 +216,8 @@ fn dfrc_games_roundtrip() {
             // Every legal move's SAN finds that move again (Chess960 castling
             // can share its squares with a normal king move).
             for &o in &l {
-                let s = pgn::san(&pos, o, &l);
-                assert_eq!(pgn::find_san(&pos, &s), Some(o), "{} in {}", s, pos.to_fen());
+                let s = crate::san::san(&pos, o, &l);
+                assert_eq!(crate::san::find_san(&pos, &s), Some(o), "{} in {}", s, pos.to_fen());
             }
             // Packing then unpacking any position gives it back.
             let (back, _, _) = viri::unpack_board(&viri::pack_board(&pos, 0, 1)).unwrap();
@@ -236,8 +236,8 @@ fn dfrc_king_move_vs_castling_san() {
     // King d8 with a queen-side right (rook a8): O-O-O puts the king on c8,
     // which is also an ordinary king move. Seen in real OB DFRC games.
     let pos = Position::from_fen("r2k1rb1/1pqpp3/6R1/n1P1Pn2/pQ6/P7/2P2P2/B1KR1B1N b fa - 2 19").unwrap();
-    let k = pgn::find_san(&pos, "Kc8").unwrap();
-    let c = pgn::find_san(&pos, "O-O-O").unwrap();
+    let k = crate::san::find_san(&pos, "Kc8").unwrap();
+    let c = crate::san::find_san(&pos, "O-O-O").unwrap();
     assert_eq!((mfrom(k), mto(k), mflag(k)), (59, 58, F_QUIET));
     assert_eq!((mfrom(c), mto(c), mflag(c)), (59, 58, F_QCASTLE));
 }

@@ -1,9 +1,11 @@
 mod attacks;
 mod datagen;
+mod epd;
 mod eval;
 mod nnue;
 mod params;
 mod position;
+mod san;
 mod search;
 mod smp;
 mod tb;
@@ -346,6 +348,37 @@ fn main() {
             "tune-spec" => {
                 params::print_spec();
                 return;
+            }
+            "epd" if args.len() >= 3 => {
+                // epd <file> [nodes N | movetime MS | depth D] [hash MB] [threads T] [perft D] [verbose]
+                let mut limit = epd::Limit::Nodes(1_000_000);
+                let (mut hash, mut threads, mut perft_max, mut verbose) = (64, 1, 5, false);
+                let mut i = 3;
+                while i < args.len() {
+                    let val = args.get(i + 1).and_then(|v| v.parse::<u64>().ok());
+                    match (args[i].as_str(), val) {
+                        ("nodes", Some(v)) => limit = epd::Limit::Nodes(v),
+                        ("movetime", Some(v)) => limit = epd::Limit::Ms(v),
+                        ("depth", Some(v)) => limit = epd::Limit::Depth(v as i32),
+                        ("hash", Some(v)) => hash = v as usize,
+                        ("threads", Some(v)) => threads = (v as usize).clamp(1, MAX_THREADS),
+                        ("perft", Some(v)) => perft_max = v as u32,
+                        ("verbose", _) => {
+                            verbose = true;
+                            i += 1;
+                            continue;
+                        }
+                        _ => {
+                            eprintln!(
+                                "usage: incipit epd <file> [nodes N | movetime MS | depth D] [hash MB] [threads T] [perft D] [verbose]"
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+                    i += 2;
+                }
+                let sum = epd::run(&args[2], limit, hash, threads, perft_max, verbose);
+                std::process::exit(if sum.perft_bad > 0 { 1 } else { 0 });
             }
             "perftsuite" => {
                 perft_suite(&args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5));

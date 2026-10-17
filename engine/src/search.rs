@@ -336,6 +336,19 @@ pub struct Searcher {
     /// The score of root_best's search (set with it), returned with it when a
     /// search stops mid-iteration.
     root_best_score: i32,
+    /// When Some, every completed iteration is appended (the EPD suite runner
+    /// uses it for the depth at which a solution was found and kept).
+    pub iter_log: Option<Vec<IterRecord>>,
+}
+
+/// One completed iteration: depth, best move, score, nodes and time so far.
+#[derive(Clone, Copy)]
+pub struct IterRecord {
+    pub depth: i32,
+    pub best: Move,
+    pub score: i32,
+    pub nodes: u64,
+    pub ms: u64,
 }
 
 #[inline(always)]
@@ -454,7 +467,7 @@ fn wdl_str(s: i32, pos: &Position) -> String {
     format!(" wdl {} {} {}", w, (1000 - w - l).max(0), l)
 }
 
-fn score_str(s: i32) -> String {
+pub(crate) fn score_str(s: i32) -> String {
     if s >= MATE - MAX_PLY as i32 {
         format!("mate {}", (MATE - s + 1) / 2)
     } else if s <= -(MATE - MAX_PLY as i32) {
@@ -505,6 +518,7 @@ impl Searcher {
             root_depth: 0,
             root_best: 0,
             root_best_score: 0,
+            iter_log: None,
             no_nmp_ply: usize::MAX,
             search_moves: Vec::new(),
             lmr,
@@ -1046,6 +1060,12 @@ impl Searcher {
             if !self.silent {
                 self.print_info(d, score);
                 reported = if self.pv_len[0] > 0 { self.pv[0][0] } else { best };
+            }
+            if self.iter_log.is_some() {
+                let (nodes, ms) = (self.total_nodes(), self.elapsed_ms());
+                if let Some(log) = self.iter_log.as_mut() {
+                    log.push(IterRecord { depth: d, best, score, nodes, ms });
+                }
             }
             if best == prev_best {
                 stability = (stability + 1).min(10);

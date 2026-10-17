@@ -11,6 +11,9 @@ mod attacks;
 #[path = "../../engine/src/position.rs"]
 mod position;
 #[allow(dead_code)]
+#[path = "../../engine/src/san.rs"]
+mod san;
+#[allow(dead_code)]
 #[path = "../../engine/src/tb.rs"]
 mod tb;
 
