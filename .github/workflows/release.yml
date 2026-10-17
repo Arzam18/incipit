@@ -58,8 +58,6 @@ jobs:
             EVALFILE="$net" RUSTFLAGS="-Ctarget-feature=+crt-static" \
             cargo build --release --target aarch64-unknown-linux-gnu
           cp target/aarch64-unknown-linux-gnu/release/incipit ../dist/incipit-$ver-linux-aarch64
-          # The embedded net, attached to the release for anyone building from source.
-          cp "$net" ../dist/
           ls -l ../dist
 
       - name: Check Linux builds
