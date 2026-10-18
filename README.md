@@ -28,7 +28,8 @@ Prebuilt binaries are attached to each [release](https://github.com/adamtwiss/in
 |---|---|
 | `incipit-vX.Y.Z-linux-x86-64` | Linux, x86-64 |
 | `incipit-vX.Y.Z-windows-x86-64.exe` | Windows, x86-64 |
-| `incipit-vX.Y.Z-macos-universal` | macOS, Apple Silicon and Intel |
+| `incipit-vX.Y.Z-macos-arm64` | macOS, Apple Silicon |
+| `incipit-vX.Y.Z-macos-x86-64` | macOS, Intel |
 | `incipit-vX.Y.Z-linux-aarch64` | Linux, 64-bit ARM |
 
 The x86-64 builds need AVX2 and BMI2 (Intel Haswell or AMD Zen 1 and later). Faster code paths (AVX-512, VNNI, PEXT) are chosen at start-up when the CPU has them; `incipit bench` prints what was chosen.

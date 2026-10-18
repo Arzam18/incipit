@@ -7,8 +7,8 @@
 #       on); AVX-512 (+VNNI) NNUE kernels and PEXT (not on Zen 1/2) chosen at
 #       start-up. Windows is cross-compiled with MinGW.
 #   linux-aarch64  ARMv8.0 baseline (NEON), cross-compiled, checked under QEMU.
-#   macos-universal  one fat binary (lipo): arm64 for Apple Silicon (built for
-#       apple-m1) and x86-64-v3 for Intel Macs.
+#   macos-arm64  Apple Silicon (built for apple-m1).
+#   macos-x86-64  Intel Macs (x86-64-v3); checked under Rosetta.
 # `bench` prints the indexing and kernels each machine chose.
 name: release
 
@@ -112,7 +112,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: make net
-      - name: Build (arm64 + x86-64, one fat binary)
+      - name: Build (arm64 and x86-64, one binary each)
         working-directory: engine
         run: |
           net="$PWD/$(basename "$(cat net.txt)")"
@@ -120,13 +120,15 @@ jobs:
           EVALFILE="$net" RUSTFLAGS="-Ctarget-cpu=apple-m1" cargo build --release --target aarch64-apple-darwin
           EVALFILE="$net" RUSTFLAGS="-Ctarget-cpu=x86-64-v3" cargo build --release --target x86_64-apple-darwin
           mkdir -p ../dist
-          lipo -create -output ../dist/incipit-$ver-macos-universal \
-            target/aarch64-apple-darwin/release/incipit target/x86_64-apple-darwin/release/incipit
-          lipo -info ../dist/incipit-$ver-macos-universal
-      - name: Bench the arm64 half
+          # Two binaries rather than one universal (lipo) file: each slice of a
+          # universal binary embeds its own copy of the net, doubling the size.
+          cp target/aarch64-apple-darwin/release/incipit ../dist/incipit-$ver-macos-arm64
+          cp target/x86_64-apple-darwin/release/incipit ../dist/incipit-$ver-macos-x86-64
+          file ../dist/incipit-$ver-macos-*
+      - name: Bench the arm64 build
         run: |
           want=$(git log -50 --format=%B | sed -n 's/^Bench: \([0-9]*\)$/\1/p' | head -1)
-          out=$(arch -arm64 dist/*-macos-universal bench | tail -2)
+          out=$(dist/*-macos-arm64 bench | tail -2)
           echo "$out" | head -1
           got=$(echo "$out" | tail -1 | cut -d' ' -f1)
           echo "arm64: bench $got (want $want)"
@@ -137,8 +139,8 @@ jobs:
           path: dist/
 
   check-macos-intel:
-    # No Intel macOS runners any more: the x86-64 half runs under Rosetta
-    # (macOS 15's supports AVX2), which checks the slice is valid and
+    # No Intel macOS runners any more: the x86-64 build runs under Rosetta
+    # (macOS 15's supports AVX2), which checks the binary is valid and
     # complete, not its speed.
     needs: macos
     runs-on: macos-15
@@ -150,12 +152,12 @@ jobs:
         with:
           name: incipit-macos
           path: dist
-      - name: Bench the x86-64 half
+      - name: Bench the x86-64 build
         run: |
-          chmod +x dist/*-macos-universal
+          chmod +x dist/*-macos-x86-64
           softwareupdate --install-rosetta --agree-to-license > /dev/null 2>&1 || true
           want=$(git log -50 --format=%B | sed -n 's/^Bench: \([0-9]*\)$/\1/p' | head -1)
-          out=$(arch -x86_64 dist/*-macos-universal bench | tail -2)
+          out=$(arch -x86_64 dist/*-macos-x86-64 bench | tail -2)
           echo "$out" | head -1
           got=$(echo "$out" | tail -1 | cut -d' ' -f1)
           echo "x86-64: bench $got (want $want)"
