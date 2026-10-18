@@ -601,6 +601,8 @@ fn main() {
                 println!("option name MoveReserve type spin default 0 min 0 max 100");
                 println!("option name Ponder type check default false");
                 println!("option name UCI_Chess960 type check default false");
+                println!("option name MultiPV type spin default 1 min 1 max 256");
+                println!("option name Clear Hash type button");
                 println!("option name UCI_ShowWDL type check default false");
                 println!("option name NormalizeScore type check default true");
                 println!("option name TmLog type check default false");
@@ -620,6 +622,12 @@ fn main() {
                 let lower: Vec<String> = toks.iter().map(|s| s.to_lowercase()).collect();
                 let ni = lower.iter().position(|s| s == "name");
                 let vi = lower.iter().position(|s| s == "value");
+                // A button (no value): Clear Hash empties the TT and every
+                // thread's histories, as ucinewgame does.
+                if ni.is_some_and(|ni| vi.is_none() && lower[ni + 1..].join(" ") == "clear hash") {
+                    uci.searcher.clear();
+                    uci.pool.each(|s| s.clear());
+                }
                 if let Some((ni, vi)) = ni.zip(vi).filter(|(ni, vi)| vi > ni) {
                     let name = lower[ni + 1..vi].join(" ");
                     let val = toks.get(vi + 1).copied().unwrap_or("");
@@ -688,6 +696,11 @@ fn main() {
                             search::SHOW_WDL.store(val.eq_ignore_ascii_case("true"), Ordering::Relaxed);
                         }
                         "tmlog" => search::TM_LOG.store(val.eq_ignore_ascii_case("true"), Ordering::Relaxed),
+                        "multipv" => {
+                            if let Ok(v) = val.parse::<usize>() {
+                                uci.searcher.multi_pv = v.clamp(1, 256);
+                            }
+                        }
                         "normalizescore" => {
                             search::NORMALIZE_SCORE.store(val.eq_ignore_ascii_case("true"), Ordering::Relaxed)
                         }

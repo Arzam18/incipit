@@ -51,6 +51,8 @@ The x86-64 builds need AVX2 and BMI2 (Intel Haswell or AMD Zen 1 and later). Fas
 | `Threads` | 1 | Search threads (1-256). |
 | `MoveOverhead` | 20 | Milliseconds reserved per move for communication lag (0-5000). `Move Overhead` is accepted too. |
 | `Ponder` | false | Allow pondering. |
+| `MultiPV` | 1 | Number of best lines to search and report (1-256), for analysis. |
+| `Clear Hash` | (button) | Empty the transposition table and history tables. |
 | `UCI_Chess960` | false | Chess960 castling notation (king takes rook). |
 | `UCI_ShowWDL` | false | Add win/draw/loss estimates (per mille) to `info` lines. |
 | `NormalizeScore` | true | Report scores on the 100 = 50% winning-chance scale; false gives the network's raw scale. |

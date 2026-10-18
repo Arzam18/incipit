@@ -338,6 +338,13 @@ pub struct Searcher {
     /// When Some, every completed iteration is appended (the EPD suite runner
     /// uses it for the depth at which a solution was found and kept).
     pub iter_log: Option<Vec<IterRecord>>,
+    /// UCI MultiPV: the number of root lines to search and report (1 = normal).
+    pub multi_pv: usize,
+    /// Root moves skipped by the root search: the moves of the earlier MultiPV
+    /// lines while a later line is searched (empty otherwise).
+    root_excluded: Vec<Move>,
+    /// Each MultiPV line's score at the last completed depth (aspiration centres).
+    line_scores: Vec<i32>,
 }
 
 /// One completed iteration: depth, best move, score, nodes and time so far.
@@ -543,6 +550,9 @@ impl Searcher {
             root_best: 0,
             root_best_score: 0,
             iter_log: None,
+            multi_pv: 1,
+            root_excluded: Vec::new(),
+            line_scores: Vec::new(),
             no_nmp_ply: usize::MAX,
             search_moves: Vec::new(),
             lmr,
@@ -920,17 +930,22 @@ impl Searcher {
         for r in self.root_node_counts.iter_mut() {
             *r = [0; 64];
         }
-        // fallback move
+        // fallback move, and the number of root moves (MultiPV can't report more lines)
         let mut list = MoveList::new();
         root.gen_moves(&mut list, false);
         let mut fallback = 0;
+        let mut root_moves = 0;
         for i in 0..list.len() {
             let mut c = *root;
             if (self.search_moves.is_empty() || self.search_moves.contains(&list[i])) && c.make_move(list[i]) {
-                fallback = list[i];
-                break;
+                if fallback == 0 {
+                    fallback = list[i];
+                }
+                root_moves += 1;
             }
         }
+        self.root_excluded.clear();
+        self.line_scores.clear();
         if fallback == 0 {
             if !self.silent {
                 println!("info depth 0 score {} nodes 0 time 0", if root.checkers != 0 { "mate 0" } else { "cp 0" });
@@ -1087,8 +1102,47 @@ impl Searcher {
             if best == 0 {
                 best = fallback;
             }
+            // MultiPV: lines 2..N, each the best root move once the earlier
+            // lines' moves are excluded. Line 1 (above) alone decides bestmove,
+            // ponder and time management, so its PV and root best are restored.
+            let mut lines: Vec<(i32, Vec<Move>)> = Vec::new();
+            if self.multi_pv > 1 && self.thread_id == 0 && root_moves > 1 && self.pv_len[0] > 0 {
+                let line1: Vec<Move> = self.pv[0][..self.pv_len[0]].to_vec();
+                let (rb, rbs) = (self.root_best, self.root_best_score);
+                lines.push((score, line1.clone()));
+                self.root_excluded.push(best);
+                for k in 1..self.multi_pv.min(root_moves) {
+                    let prev = self.line_scores.get(k).copied().unwrap_or(score);
+                    let v = self.search_line(root, d, prev);
+                    if self.stopped || self.pv_len[0] == 0 {
+                        break;
+                    }
+                    let pv = self.pv[0][..self.pv_len[0]].to_vec();
+                    self.root_excluded.push(pv[0]);
+                    lines.push((v, pv));
+                }
+                self.root_excluded.clear();
+                // Lines searched in different windows can come out of order: sort
+                // them, and if a later line beat line 1 it becomes the best move
+                // (bestmove matches `multipv 1`, as GUIs expect).
+                lines.sort_by_key(|l| -l.0);
+                let top = &lines[0].1;
+                self.pv[0][..top.len()].copy_from_slice(top);
+                self.pv_len[0] = top.len();
+                if top[0] == line1[0] {
+                    (self.root_best, self.root_best_score) = (rb, rbs);
+                } else {
+                    (self.root_best, self.root_best_score) = (top[0], lines[0].0);
+                    (best, score) = (top[0], lines[0].0);
+                }
+                self.line_scores = lines.iter().map(|l| l.0).collect();
+            }
             if !self.silent {
-                self.print_info(d, score);
+                if lines.is_empty() {
+                    self.print_info(d, score);
+                } else {
+                    self.print_multipv(d, &lines);
+                }
                 reported = if self.pv_len[0] > 0 { self.pv[0][0] } else { best };
             }
             if self.iter_log.is_some() {
@@ -1176,6 +1230,60 @@ impl Searcher {
             );
         }
         (best, score)
+    }
+
+    /// A MultiPV line's search at depth `d`: an aspiration window around the
+    /// line's previous score, widened on a fail as the main iteration does.
+    fn search_line(&mut self, root: &Position, d: i32, prev: i32) -> i32 {
+        let mut delta = tp(P::AspDelta);
+        let (mut a, mut b) =
+            if d >= 4 && on(P::UseAsp) && prev.abs() < MATE_BOUND { (prev - delta, prev + delta) } else { (-INF, INF) };
+        loop {
+            let s = self.negamax(root, a, b, d, 0, false);
+            if self.stopped {
+                return s;
+            }
+            if s <= a {
+                b = (a + b) / 2;
+                a = (s - delta).max(-INF);
+            } else if s >= b {
+                b = (s + delta).min(INF);
+            } else {
+                return s;
+            }
+            delta += delta / 2;
+            if delta > 1000 {
+                a = -INF;
+                b = INF;
+            }
+        }
+    }
+
+    /// One info line per MultiPV line (`multipv 1` is the line bestmove plays);
+    /// line 1 is also kept as the last info line for a ponder-hit repeat.
+    fn print_multipv(&mut self, d: i32, lines: &[(i32, Vec<Move>)]) {
+        let el = self.elapsed_ms();
+        let nodes = self.total_nodes();
+        for (k, (score, moves)) in lines.iter().enumerate() {
+            let pv: String = moves.iter().map(|&m| format!(" {}", self.root_pos.move_uci(m))).collect();
+            if k == 0 {
+                self.pt.last_info = (d, self.seldepth, *score, pv.clone());
+            }
+            println!(
+                "info depth {} seldepth {} multipv {} score {}{} nodes {} nps {} hashfull {} tbhits {} time {} pv{}",
+                d,
+                self.seldepth,
+                k + 1,
+                score_str(*score, &self.root_pos),
+                wdl_str(*score, &self.root_pos),
+                nodes,
+                nodes * 1000 / el.max(1),
+                self.tt.hashfull(),
+                self.tb_hits,
+                el,
+                pv
+            );
+        }
     }
 
     fn print_info(&mut self, d: i32, score: i32) {
@@ -1627,7 +1735,11 @@ impl Searcher {
             let m = list[i];
             let mscore = scores[i];
             i += 1;
-            if m == excluded || (root && !self.search_moves.is_empty() && !self.search_moves.contains(&m)) {
+            if m == excluded
+                || (root
+                    && ((!self.search_moves.is_empty() && !self.search_moves.contains(&m))
+                        || self.root_excluded.contains(&m)))
+            {
                 continue;
             }
             let quiet = !is_noisy(m);
@@ -2193,6 +2305,27 @@ impl Searcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MultiPV: the best move is unchanged by asking for more lines (here a
+    /// mate in one among other good moves), more lines than legal moves is
+    /// fine, and the root exclusions are cleared after the search.
+    #[test]
+    fn multipv_lines() {
+        crate::attacks::init();
+        crate::nnue::init();
+        let mut s = Searcher::new(8, Arc::new(AtomicBool::new(false)));
+        s.silent = true;
+        let lim = Limits { soft_ms: None, hard_ms: None, depth: 6, nodes: None };
+        let pos = Position::from_fen("6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1").unwrap();
+        for n in [1, 3, 256] {
+            s.multi_pv = n;
+            s.clear();
+            let (m, sc) = s.search(&pos, &lim);
+            assert_eq!(pos.move_uci(m), "d1d8");
+            assert_eq!(sc, MATE - 1);
+            assert!(s.root_excluded.is_empty());
+        }
+    }
 
     /// Printed scores: 100 at the WDL model's 50%-win score, scaled in
     /// proportion, sign kept; mate and tablebase scores as before.

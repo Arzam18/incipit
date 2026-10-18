@@ -103,6 +103,10 @@ for r in range(ROUNDS):
     if rng.random() < 0.05:
         send(f"setoption name Hash value {rng.choice([1, 8, 16, 64])}")
     if rng.random() < 0.1:
+        send(f"setoption name MultiPV value {rng.choice([1, 1, 2, 3, 8])}")
+    if rng.random() < 0.05:
+        send("setoption name Clear Hash")
+    if rng.random() < 0.1:
         send("ucinewgame")
     pos, moves = rng.choice(POSITIONS)
     send(pos)
