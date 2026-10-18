@@ -49,6 +49,8 @@ usage:
                                               score under the set's WDL model (wdlfit's a and b), so
                                               sigmoid(score / 400) is the label's calibrated
                                               probability; unscored positions unchanged
+  datatools bishopstats <out.csv> <in.vf> ... one bishop a side: opposite- vs same-coloured, score and result
+                                              by pawn lead (side to move), to check how nets score OCB endings
   datatools matstats <out.csv> <in.vf> ...    stored score and result by material lead, side to move,
                                               to check labels in decided positions (quiet moves only)
   datatools net <source> <in> <out_dir> [options]
@@ -87,6 +89,7 @@ fn main() {
         Some("wdlstats") if args.len() >= 4 => cmd_wdlstats(&args[2], &args[3..]),
         Some("piecestats") if args.len() >= 3 => cmd_piecestats(&args[2..]),
         Some("matstats") if args.len() >= 4 => cmd_matstats(&args[2], &args[3..]),
+        Some("bishopstats") if args.len() >= 4 => cmd_bishopstats(&args[2], &args[3..]),
         Some("wdlfit") if args.len() >= 3 => cmd_wdlfit(&args[2]),
         Some("rescale") if args.len() >= 5 => cmd_rescale(&args[2], &args[3], &args[4..]),
         Some("calibrate") if args.len() >= 6 => cmd_calibrate(&args[2], &args[3], &args[4], &args[5..]),
@@ -403,6 +406,51 @@ fn cmd_matstats(out: &str, inputs: &[String]) -> Result<(), String> {
     let mut w = String::from("piece_lead,pawn_lead,score,result,count\n");
     for ((a, p, b, r), n) in counts {
         w.push_str(&format!("{},{},{},{},{}\n", a, p, b, r, n));
+    }
+    std::fs::write(out, w).map_err(|e| format!("{}: {}", out, e))?;
+    println!("{} positions counted -> {}", used, out);
+    Ok(())
+}
+
+/// Positions with exactly one bishop a side: opposite- vs same-coloured
+/// bishops, by whether only bishops and pawns are left, pawn lead, stored
+/// score and result (side to move; from ply 16, quiet moves, not in check).
+/// For checking whether the nets score opposite-coloured bishops as drawish.
+fn cmd_bishopstats(out: &str, inputs: &[String]) -> Result<(), String> {
+    use position::{BISHOP, KNIGHT, PAWN, QUEEN, ROOK};
+    use std::collections::BTreeMap;
+    const STEP: i32 = 25;
+    const SCORE_MAX: i32 = 3000;
+    const DARK: u64 = 0xAA55_AA55_AA55_AA55;
+    let mut counts: BTreeMap<(u8, u8, i32, i32, u8), u64> = BTreeMap::new();
+    let mut used = 0u64;
+    for input in inputs {
+        let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
+        viri::for_each_position(&data, |pos, m, score, wdl| {
+            let ply = 2 * (pos.fullmove as i32 - 1) + (pos.stm != position::WHITE) as i32;
+            if score == viri::NO_SCORE || pos.checkers != 0 || ply < 16 || position::is_noisy(m) {
+                return;
+            }
+            let (wb, bb) = (pos.pieces[BISHOP] & pos.colors[0], pos.pieces[BISHOP] & pos.colors[1]);
+            if wb.count_ones() != 1 || bb.count_ones() != 1 {
+                return;
+            }
+            let ocb = ((wb & DARK != 0) != (bb & DARK != 0)) as u8;
+            let others = pos.pieces[KNIGHT] | pos.pieces[ROOK] | pos.pieces[QUEEN];
+            let pure = (others == 0) as u8;
+            let white = pos.stm == position::WHITE;
+            let s = if white { score as i32 } else { -(score as i32) };
+            let r = if white { wdl } else { 2 - wdl };
+            let pawns = |c: usize| (pos.pieces[PAWN] & pos.colors[c]).count_ones() as i32;
+            let lead = pawns(pos.stm) - pawns(pos.stm ^ 1);
+            let b = (s.clamp(-SCORE_MAX, SCORE_MAX) as f64 / STEP as f64).round() as i32 * STEP;
+            *counts.entry((pure, ocb, lead, b, r)).or_default() += 1;
+            used += 1;
+        })?;
+    }
+    let mut w = String::from("pure,ocb,pawn_lead,score,result,count\n");
+    for ((p, o, l, b, r), n) in counts {
+        w.push_str(&format!("{},{},{},{},{},{}\n", p, o, l, b, r, n));
     }
     std::fs::write(out, w).map_err(|e| format!("{}: {}", out, e))?;
     println!("{} positions counted -> {}", used, out);
