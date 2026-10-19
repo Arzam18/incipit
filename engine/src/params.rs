@@ -39,53 +39,53 @@ macro_rules! params {
 
 // name = UCI name, default, min, max, SPSA step (c_end). Step = (max - min) / 20, at least 1.
 params! {
-    RfpMargin = "RfpMargin", 66, 30, 150, 6;
+    RfpMargin = "RfpMargin", 70, 30, 150, 6;
     // Razoring at any depth: eval + RazorBase + RazorMul * depth^2 <= alpha. Starting values
     // fit the old tuned linear margin (242 + 312 * depth, depth <= 3) at depths 1 and 3.
-    RazorBase = "RazorBase", 466, 100, 800, 35;
-    RazorMul = "RazorMul", 78, 20, 200, 9;
+    RazorBase = "RazorBase", 400, 100, 800, 35;
+    RazorMul = "RazorMul", 81, 20, 200, 9;
     NmpEvalDiv = "NmpEvalDiv", 165, 100, 400, 15;
-    ProbcutMargin = "ProbcutMargin", 216, 100, 350, 13;
-    FutBase = "FutBase", 79, 30, 250, 11;
-    FutMul = "FutMul", 83, 40, 200, 8;
+    ProbcutMargin = "ProbcutMargin", 217, 100, 350, 13;
+    FutBase = "FutBase", 73, 30, 250, 11;
+    FutMul = "FutMul", 75, 40, 200, 8;
     // Futility margin by quiet history: a quiet's history sum (the ordering
     // score, four tables of +-16384) over this is added to the margin, so a
     // well-scored quiet survives a margin a badly scored one does not. Start:
     // 128, so a move at one table's ceiling adds 128 cp, about one depth of
     // FutMul.
-    FutHistDiv = "FutHistDiv", 128, 32, 512, 12;
-    HistPrune = "HistPrune", 3139, 500, 5000, 225;
-    SeeQuiet = "SeeQuiet", 11, 0, 80, 4;
+    FutHistDiv = "FutHistDiv", 118, 32, 512, 12;
+    HistPrune = "HistPrune", 3106, 500, 5000, 225;
+    SeeQuiet = "SeeQuiet", 10, 0, 80, 4;
     // Quiet SEE bar by history: the history sum over this is subtracted from
     // the bar. Start 128, the same scale as FutHistDiv (a table ceiling of
     // 16384 moves the bar by 128 cp).
-    SeeHistDiv = "SeeHistDiv", 128, 32, 512, 12;
-    SeeNoisy = "SeeNoisy", 101, 10, 200, 10;
-    LmrBaseX100 = "LmrBaseX100", 42, 30, 130, 5;
-    LmrDivX100 = "LmrDivX100", 307, 150, 350, 10;
-    LmrHistDiv = "LmrHistDiv", 9103, 3000, 16000, 650;
+    SeeHistDiv = "SeeHistDiv", 137, 32, 512, 12;
+    SeeNoisy = "SeeNoisy", 108, 10, 200, 10;
+    LmrBaseX100 = "LmrBaseX100", 44, 30, 130, 5;
+    LmrDivX100 = "LmrDivX100", 298, 150, 350, 10;
+    LmrHistDiv = "LmrHistDiv", 9359, 3000, 16000, 650;
     AspDelta = "AspDelta", 15, 3, 40, 2;
-    HistMul = "HistMul", 305, 100, 500, 20;
-    HistOff = "HistOff", 177, 0, 500, 25;
-    HistMax = "HistMax", 2677, 1000, 4000, 150;
+    HistMul = "HistMul", 338, 100, 500, 20;
+    HistOff = "HistOff", 146, 0, 500, 25;
+    HistMax = "HistMax", 2796, 1000, 4000, 150;
     // Bonus for the opponent's previous quiet move when this node fails low (it refuted
     // every reply): PriorBonusPct% of the cutoff bonus at this depth. Half, as weaker
     // evidence than a cutoff; 0 disables it.
-    PriorBonusPct = "PriorBonusPct", 53, 0, 150, 8;
+    PriorBonusPct = "PriorBonusPct", 54, 0, 150, 8;
     SeDouble = "SeDouble", 13, 5, 50, 2;
     // A reduced search that beats the best score so far by more than LmrDeeper is
     // re-searched one ply deeper than the full depth (half a pawn, round value).
-    LmrDeeper = "LmrDeeper", 50, 10, 200, 10;
-    RfpDepth = "RfpDepth", 8, 3, 12, 1;
+    LmrDeeper = "LmrDeeper", 49, 10, 200, 10;
+    RfpDepth = "RfpDepth", 7, 3, 12, 1;
     // Null move needs static_eval >= beta - NmpDepthMul * depth + NmpMarginBase.
-    NmpDepthMul = "NmpDepthMul", 23, 0, 60, 3;
-    NmpMarginBase = "NmpMarginBase", 135, 0, 400, 20;
+    NmpDepthMul = "NmpDepthMul", 24, 0, 60, 3;
+    NmpMarginBase = "NmpMarginBase", 142, 0, 400, 20;
     // Largest |TT score| still used for a cutoff at halfmove >= 90 (half a pawn).
-    HmGuard = "HmGuard", 57, 0, 300, 15;
+    HmGuard = "HmGuard", 43, 0, 300, 15;
     NmpBase = "NmpBase", 5, 2, 7, 1;
     LmpBase = "LmpBase", 6, 1, 8, 1;
-    SeMul = "SeMul", 28, 8, 40, 2;
-    CapLmrDiv = "CapLmrDiv", 3372, 2000, 16000, 700;
+    SeMul = "SeMul", 30, 8, 40, 2;
+    CapLmrDiv = "CapLmrDiv", 3530, 2000, 16000, 700;
     TmSoftDiv = "TmSoftDiv", 28, 12, 40, 1;
     TmIncPct = "TmIncPct", 79, 40, 100, 3;
     TmHardMul = "TmHardMul", 5, 2, 6, 1;
@@ -118,48 +118,48 @@ params! {
     // Verify a null-move cutoff with a reduced real search from this depth on
     // (null move stays off at that ply). Start: 12, where a null-move cut
     // prunes a subtree deep enough for a zugzwang to matter.
-    NmpVerifyDepth = "NmpVerifyDepth", 11, 6, 30, 2;
+    NmpVerifyDepth = "NmpVerifyDepth", 12, 6, 30, 2;
     ProbcutDepth = "ProbcutDepth", 3, 3, 8, 1;
-    ProbcutRed = "ProbcutRed", 6, 2, 6, 1;
+    ProbcutRed = "ProbcutRed", 5, 2, 6, 1;
     IirDepth = "IirDepth", 2, 2, 8, 1;
-    FutDepth = "FutDepth", 9, 4, 12, 1;
+    FutDepth = "FutDepth", 10, 4, 12, 1;
     HistPruneDepth = "HistPruneDepth", 5, 2, 8, 1;
     SeeNoisyDepth = "SeeNoisyDepth", 6, 3, 10, 1;
     // A capture whose static exchange gain is at least this (cp, half a pawn
     // below zero) is ordered as a good capture, before the killers and quiets;
     // the rest follow the quiets, and with staged generation the quiets are
     // generated as soon as only those remain.
-    GoodCaptureSee = "GoodCaptureSee", -50, -150, 0, 8;
+    GoodCaptureSee = "GoodCaptureSee", -56, -150, 0, 8;
     // SEE piece values (pawn = 100), textbook starting values: used by SEE pruning,
     // ProbCut, qsearch SEE and capture ordering.
-    SeeKnight = "SeeKnight", 320, 150, 650, 25;
-    SeeBishop = "SeeBishop", 333, 150, 650, 25;
-    SeeRook = "SeeRook", 509, 250, 1000, 37;
-    SeeQueen = "SeeQueen", 944, 500, 2000, 75;
+    SeeKnight = "SeeKnight", 300, 150, 650, 25;
+    SeeBishop = "SeeBishop", 342, 150, 650, 25;
+    SeeRook = "SeeRook", 499, 250, 1000, 37;
+    SeeQueen = "SeeQueen", 928, 500, 2000, 75;
     SeDepth = "SeDepth", 5, 4, 10, 1;
     // A TT entry qualifies its move for the singular test when its depth is
     // at least the node's depth minus this. Start: 3, the value used so far.
-    SeTtDepth = "SeTtDepth", 3, 0, 6, 1;
+    SeTtDepth = "SeTtDepth", 4, 0, 6, 1;
     // TT replacement: a was-PV entry counts this many plies deeper when a
     // victim is chosen. Start 2, a small round value (one age step is 8).
-    TtPvKeep = "TtPvKeep", 2, 0, 8, 1;
+    TtPvKeep = "TtPvKeep", 1, 0, 8, 1;
     // Correction history. The eval correction is (CorrPawnWeight * pawn entry +
     // CorrNonPawnWeight * (white + black non-pawn entries)) / 128; the defaults are the
     // original 2:1:1 weighting, as separate weights so SPSA can move each one.
-    CorrPawnWeight = "CorrPawnWeight", 99, 0, 256, 13;
-    CorrNonPawnWeight = "CorrNonPawnWeight", 107, 0, 256, 13;
+    CorrPawnWeight = "CorrPawnWeight", 95, 0, 256, 13;
+    CorrNonPawnWeight = "CorrNonPawnWeight", 124, 0, 256, 13;
     // Update: an entry moves toward the search's eval error (clamped to
     // +-CorrDiffClamp cp) by min(depth + 1, CorrUpdateCap) / 256; entries are
     // kept within +-CorrLimit cp.
     CorrUpdateCap = "CorrUpdateCap", 13, 4, 64, 3;
-    CorrDiffClamp = "CorrDiffClamp", 439, 100, 1000, 45;
-    CorrLimit = "CorrLimit", 47, 16, 256, 12;
+    CorrDiffClamp = "CorrDiffClamp", 416, 100, 1000, 45;
+    CorrLimit = "CorrLimit", 48, 16, 256, 12;
     // Weight of the continuation correction (keyed by the previous move's
     // piece and square): half the pawn table's original weight of 128, as
     // one non-pawn table had, until SPSA says otherwise.
-    CorrContWeight = "CorrContWeight", 63, 0, 256, 13;
+    CorrContWeight = "CorrContWeight", 64, 0, 256, 13;
     // Ply-2 continuation correction weight: the round start the ply-1 table had (64).
-    CorrCont2Weight = "CorrCont2Weight", 64, 0, 256, 13;
+    CorrCont2Weight = "CorrCont2Weight", 69, 0, 256, 13;
     // Network output multiplier in percent, applied to every search eval. Lets a
     // net trained on differently scaled labels be run at Incipit's eval scale
     // (which the pruning margins and other cp thresholds are tuned to) without
