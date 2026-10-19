@@ -110,6 +110,9 @@ params! {
     TmNodeBase = "TmNodeBase", 150, 110, 250, 10;
     TmStabAmp = "TmStabAmp", 100, 0, 200, 15;
     TmFeedMax = "TmFeedMax", 250, 100, 400, 20;
+    // Soft-target extensions stop at |score| >= TmDecided (internal cp; round
+    // value at the start of the bucket where extension gained nothing).
+    TmDecided = "TmDecided", 400, 200, 2000, 50;
     // Sudden death: keep this many moves' worth of the measured lag in reserve
     // (round value; lag-free matches measure ~0, so OB can't tune it).
     TmLagMoves = "TmLagMoves", 40, 0, 200, 10;

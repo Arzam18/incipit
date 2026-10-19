@@ -1176,7 +1176,12 @@ impl Searcher {
                 // TmScalePow > 100 makes the allocation steeper: in an offline test
                 // (7948 positions, 500k vs 1.5M nodes) the value of more search
                 // varied ~25x across the scale's range while the scale varied ~5x.
+                // A decided position (|score| >= TmDecided) gets no extension: in
+                // the offline signal test the extra search was worth ~nothing there
+                // (lichess endgames +0.002% per position vs +0.12-0.34% at 25-250 cp),
+                // yet half of those positions were extended.
                 let scale = node_scale * stab_scale * ext;
+                let scale = if score.abs() >= tp(P::TmDecided) { scale.min(1.0) } else { scale };
                 let target = soft as f64 * scale.powf(tp(P::TmScalePow) as f64 / 100.0);
                 self.pt.target_ms = target;
                 (tm_target, tm_frac, tm_done) = (target, frac, d);
