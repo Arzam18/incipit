@@ -29,14 +29,19 @@ pub const TB_WIN: i32 = MATE - 2 * MAX_PLY as i32;
 const CORR_SIZE: usize = 16384;
 pub const CORR_GRAIN: i32 = 256;
 
-/// The history's threat index of a move from `sq`: 1 when the opponent
-/// attacks the square (off: always 0, the plain table).
+/// The history's threat index of a move: bit 0 when the opponent attacks
+/// the square it leaves, bit 1 when it attacks the square it goes to
+/// (UseThreatHist2 off: only the first; UseThreatHist off: 0).
 #[inline(always)]
-fn th(threats: u64, sq: usize) -> usize {
-    if on(P::UseThreatHist) {
-        ((threats >> sq) & 1) as usize
+fn th(threats: u64, from: usize, to: usize) -> usize {
+    if !on(P::UseThreatHist) {
+        return 0;
+    }
+    let f = ((threats >> from) & 1) as usize;
+    if on(P::UseThreatHist2) {
+        f | (((threats >> to) & 1) as usize) << 1
     } else {
-        0
+        f
     }
 }
 
@@ -318,7 +323,7 @@ pub struct Searcher {
     pub tt: Arc<TT>,
     // Quiet history by side, whether the moving piece stands on a square
     // the opponent attacks, from and to.
-    hist: Box<[[[[i16; 64]; 64]; 2]; 2]>,
+    hist: Box<[[[[i16; 64]; 64]; 4]; 2]>,
     /// Continuation and correction history: one set shared by all Lazy SMP
     /// threads while they search (see SharedHist).
     pub sh: Arc<SharedHist>,
@@ -550,7 +555,7 @@ impl Searcher {
             start: Instant::now(),
             hard_ms: None,
             node_limit: None,
-            hist: Box::new([[[[0; 64]; 64]; 2]; 2]),
+            hist: Box::new([[[[0; 64]; 64]; 4]; 2]),
             sh: SharedHist::new(),
             capt: Box::new([[[0; 7]; 64]; 12]),
             killers: Align64([[0; 2]; MAX_PLY + 4]),
@@ -640,7 +645,7 @@ impl Searcher {
         // this is the only one.
         Arc::get_mut(&mut self.tt).expect("TT cleared during a search").clear();
         self.eval_cache.fill(0);
-        *self.hist = [[[[0; 64]; 64]; 2]; 2];
+        *self.hist = [[[[0; 64]; 64]; 4]; 2];
         Arc::get_mut(&mut self.sh).expect("histories cleared during a search").clear();
         *self.capt = [[[0; 7]; 64]; 12];
         self.killers = Align64([[0; 2]; MAX_PLY + 4]);
@@ -1425,7 +1430,11 @@ impl Searcher {
                     // reward quiet tt move causing cutoff
                     let bonus = (tp(P::HistMul) * depth - tp(P::HistOff)).clamp(0, tp(P::HistMax));
                     let threats = pos.attacks_by(pos.stm ^ 1);
-                    upd(&mut self.hist[pos.stm][th(threats, mfrom(tt_move))][mfrom(tt_move)][mto(tt_move)], bonus);
+                    upd(
+                        &mut self.hist[pos.stm][th(threats, mfrom(tt_move), mto(tt_move))][mfrom(tt_move)]
+                            [mto(tt_move)],
+                        bonus,
+                    );
                 }
                 self.stats.tt_cutoffs += 1;
                 return tt_score;
@@ -2051,7 +2060,7 @@ impl Searcher {
                 let prev3 = if ply >= 3 { self.stack[ply - 3].cont_idx } else { 0 };
                 let prev5 = if ply >= 5 { self.stack[ply - 5].cont_idx } else { 0 };
                 let pt = self.stack[ply - 1].threats;
-                upd(&mut self.hist[pos.stm ^ 1][th(pt, mfrom(pm))][mfrom(pm)][mto(pm)], bonus);
+                upd(&mut self.hist[pos.stm ^ 1][th(pt, mfrom(pm), mto(pm))][mfrom(pm)][mto(pm)], bonus);
                 // Its continuation entries, as seen from the opponent's node: their
                 // previous moves were ours at ply-2, -3 (theirs) and -5.
                 if prev2 != 0 {
@@ -2106,7 +2115,7 @@ impl Searcher {
     ) {
         let pc = pos.board[mfrom(m)] as usize;
         let ci = pc * 64 + mto(m);
-        upd(&mut self.hist[pos.stm][th(threats, mfrom(m))][mfrom(m)][mto(m)], bonus);
+        upd(&mut self.hist[pos.stm][th(threats, mfrom(m), mto(m))][mfrom(m)][mto(m)], bonus);
         if prev1 != 0 {
             upd_shared(&self.sh.cont[prev1][ci], bonus);
         }
@@ -2199,7 +2208,7 @@ impl Searcher {
             } else {
                 let pc = pos.board[mfrom(m)] as usize;
                 let ci = pc * 64 + mto(m);
-                self.hist[us][th(threats, mfrom(m))][mfrom(m)][mto(m)] as i32
+                self.hist[us][th(threats, mfrom(m), mto(m))][mfrom(m)][mto(m)] as i32
                     + self.sh.cont[prev1][ci].load(Ordering::Relaxed) as i32
                     + self.sh.cont[prev2][ci].load(Ordering::Relaxed) as i32
                     + self.sh.cont[prev4][ci].load(Ordering::Relaxed) as i32 / 2
