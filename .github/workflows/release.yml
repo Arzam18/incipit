@@ -8,7 +8,8 @@
 #       start-up. Windows is cross-compiled with MinGW.
 #   linux-aarch64  ARMv8.0 baseline (NEON), cross-compiled, checked under QEMU.
 #   linux-aarch64-musl  the same, linked statically against musl instead of
-#       glibc, for systems without glibc such as Android (e.g. Termux).
+#       glibc, for systems without glibc such as Android (e.g. Termux). Built
+#       and checked natively on an arm64 runner with Ubuntu's musl-tools.
 #   macos-arm64  Apple Silicon (built for apple-m1).
 #   macos-x86-64  Intel Macs (x86-64-v3); checked under Rosetta.
 # `bench` prints the indexing and kernels each machine chose.
@@ -35,13 +36,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-aarch64-linux-gnu qemu-user-static
-          rustup target add x86_64-pc-windows-gnu aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
-          # aarch64 musl C cross-compiler for the vendored Fathom code (not in
-          # Ubuntu's archive), pinned by checksum.
-          curl -fsSL --retry 3 -o /tmp/musl.tgz https://musl.cc/aarch64-linux-musl-cross.tgz
-          echo "c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38  /tmp/musl.tgz" | sha256sum -c
-          sudo tar xzf /tmp/musl.tgz -C /opt
-          echo /opt/aarch64-linux-musl-cross/bin >> "$GITHUB_PATH"
+          rustup target add x86_64-pc-windows-gnu aarch64-unknown-linux-gnu
 
       - name: Net
         working-directory: engine
@@ -66,17 +61,13 @@ jobs:
             EVALFILE="$net" RUSTFLAGS="-Ctarget-feature=+crt-static" \
             cargo build --release --target aarch64-unknown-linux-gnu
           cp target/aarch64-unknown-linux-gnu/release/incipit ../dist/incipit-$ver-linux-aarch64
-          CC=aarch64-linux-musl-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc \
-            EVALFILE="$net" RUSTFLAGS="-Ctarget-feature=+crt-static" \
-            cargo build --release --target aarch64-unknown-linux-musl
-          cp target/aarch64-unknown-linux-musl/release/incipit ../dist/incipit-$ver-linux-aarch64-musl
           ls -l ../dist
 
       - name: Check Linux builds
         run: |
           want=$(git log -50 --format=%B | sed -n 's/^Bench: \([0-9]*\)$/\1/p' | head -1)
-          for f in dist/*-linux-x86-64 dist/*-linux-aarch64 dist/*-linux-aarch64-musl; do
-            run=; case $f in *aarch64*) run=qemu-aarch64-static ;; esac
+          for f in dist/*-linux-x86-64 dist/*-linux-aarch64; do
+            run=; case $f in *aarch64) run=qemu-aarch64-static ;; esac
             out=$($run "$f" bench | tail -2)
             echo "$out" | head -1
             got=$(echo "$out" | tail -1 | cut -d' ' -f1)
@@ -87,6 +78,47 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: incipit
+          path: dist/
+
+  linux-arm-musl:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+      - name: Toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add aarch64-unknown-linux-musl
+      - name: Net
+        working-directory: engine
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: make net
+      - name: Build
+        working-directory: engine
+        run: |
+          net="$PWD/$(basename "$(cat net.txt)")"
+          ver=$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --always)
+          # musl-gcc compiles the vendored Fathom code against musl's headers;
+          # Rust links its own static musl. AR: there is no musl-ar.
+          CC=musl-gcc AR=ar EVALFILE="$net" RUSTFLAGS="-Ctarget-feature=+crt-static" \
+            cargo build --release --target aarch64-unknown-linux-musl
+          mkdir -p ../dist
+          cp target/aarch64-unknown-linux-musl/release/incipit ../dist/incipit-$ver-linux-aarch64-musl
+          file ../dist/*
+      - name: Bench the musl build
+        run: |
+          want=$(git log -50 --format=%B | sed -n 's/^Bench: \([0-9]*\)$/\1/p' | head -1)
+          out=$(dist/*-linux-aarch64-musl bench | tail -2)
+          echo "$out" | head -1
+          got=$(echo "$out" | tail -1 | cut -d' ' -f1)
+          echo "musl: bench $got (want $want)"
+          [ "$got" = "$want" ]
+      - uses: actions/upload-artifact@v4
+        with:
+          name: incipit-linux-arm-musl
           path: dist/
 
   check-windows:
@@ -177,7 +209,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, check-windows, macos, check-macos-intel]
+    needs: [build, check-windows, linux-arm-musl, macos, check-macos-intel]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
