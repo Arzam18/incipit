@@ -7,6 +7,8 @@
 #       on); AVX-512 (+VNNI) NNUE kernels and PEXT (not on Zen 1/2) chosen at
 #       start-up. Windows is cross-compiled with MinGW.
 #   linux-aarch64  ARMv8.0 baseline (NEON), cross-compiled, checked under QEMU.
+#   linux-aarch64-musl  the same, linked statically against musl instead of
+#       glibc, for systems without glibc such as Android (e.g. Termux).
 #   macos-arm64  Apple Silicon (built for apple-m1).
 #   macos-x86-64  Intel Macs (x86-64-v3); checked under Rosetta.
 # `bench` prints the indexing and kernels each machine chose.
@@ -33,7 +35,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-aarch64-linux-gnu qemu-user-static
-          rustup target add x86_64-pc-windows-gnu aarch64-unknown-linux-gnu
+          rustup target add x86_64-pc-windows-gnu aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
+          # aarch64 musl C cross-compiler for the vendored Fathom code (not in
+          # Ubuntu's archive), pinned by checksum.
+          curl -fsSL --retry 3 -o /tmp/musl.tgz https://musl.cc/aarch64-linux-musl-cross.tgz
+          echo "c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38  /tmp/musl.tgz" | sha256sum -c
+          sudo tar xzf /tmp/musl.tgz -C /opt
+          echo /opt/aarch64-linux-musl-cross/bin >> "$GITHUB_PATH"
 
       - name: Net
         working-directory: engine
@@ -58,13 +66,17 @@ jobs:
             EVALFILE="$net" RUSTFLAGS="-Ctarget-feature=+crt-static" \
             cargo build --release --target aarch64-unknown-linux-gnu
           cp target/aarch64-unknown-linux-gnu/release/incipit ../dist/incipit-$ver-linux-aarch64
+          CC=aarch64-linux-musl-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc \
+            EVALFILE="$net" RUSTFLAGS="-Ctarget-feature=+crt-static" \
+            cargo build --release --target aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/incipit ../dist/incipit-$ver-linux-aarch64-musl
           ls -l ../dist
 
       - name: Check Linux builds
         run: |
           want=$(git log -50 --format=%B | sed -n 's/^Bench: \([0-9]*\)$/\1/p' | head -1)
-          for f in dist/*-linux-x86-64 dist/*-linux-aarch64; do
-            run=; case $f in *aarch64) run=qemu-aarch64-static ;; esac
+          for f in dist/*-linux-x86-64 dist/*-linux-aarch64 dist/*-linux-aarch64-musl; do
+            run=; case $f in *aarch64*) run=qemu-aarch64-static ;; esac
             out=$($run "$f" bench | tail -2)
             echo "$out" | head -1
             got=$(echo "$out" | tail -1 | cut -d' ' -f1)
