@@ -29,9 +29,21 @@ pub const TB_WIN: i32 = MATE - 2 * MAX_PLY as i32;
 const CORR_SIZE: usize = 16384;
 pub const CORR_GRAIN: i32 = 256;
 
+/// The history's threat index of a move from `sq`: 1 when the opponent
+/// attacks the square (off: always 0, the plain table).
+#[inline(always)]
+fn th(threats: u64, sq: usize) -> usize {
+    if on(P::UseThreatHist) {
+        ((threats >> sq) & 1) as usize
+    } else {
+        0
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Frame {
     static_eval: i32,
+    threats: u64,    // squares the opponent attacks at this ply
     cont_idx: usize, // piece*64+to of the move made at this ply
     excluded: Move,
     mv: Move,
@@ -304,7 +316,9 @@ pub struct Searcher {
     /// Shared with helper threads while they search; only the owner holds
     /// it between searches (see `clear`).
     pub tt: Arc<TT>,
-    hist: Box<[[[i16; 64]; 64]; 2]>,
+    // Quiet history by side, whether the moving piece stands on a square
+    // the opponent attacks, from and to.
+    hist: Box<[[[[i16; 64]; 64]; 2]; 2]>,
     /// Continuation and correction history: one set shared by all Lazy SMP
     /// threads while they search (see SharedHist).
     pub sh: Arc<SharedHist>,
@@ -536,7 +550,7 @@ impl Searcher {
             start: Instant::now(),
             hard_ms: None,
             node_limit: None,
-            hist: Box::new([[[0; 64]; 64]; 2]),
+            hist: Box::new([[[[0; 64]; 64]; 2]; 2]),
             sh: SharedHist::new(),
             capt: Box::new([[[0; 7]; 64]; 12]),
             killers: Align64([[0; 2]; MAX_PLY + 4]),
@@ -626,7 +640,7 @@ impl Searcher {
         // this is the only one.
         Arc::get_mut(&mut self.tt).expect("TT cleared during a search").clear();
         self.eval_cache.fill(0);
-        *self.hist = [[[0; 64]; 64]; 2];
+        *self.hist = [[[[0; 64]; 64]; 2]; 2];
         Arc::get_mut(&mut self.sh).expect("histories cleared during a search").clear();
         *self.capt = [[[0; 7]; 64]; 12];
         self.killers = Align64([[0; 2]; MAX_PLY + 4]);
@@ -1410,7 +1424,8 @@ impl Searcher {
                 if tt_score >= beta && tt_move != 0 && !is_noisy(tt_move) {
                     // reward quiet tt move causing cutoff
                     let bonus = (tp(P::HistMul) * depth - tp(P::HistOff)).clamp(0, tp(P::HistMax));
-                    upd(&mut self.hist[pos.stm][mfrom(tt_move)][mto(tt_move)], bonus);
+                    let threats = pos.attacks_by(pos.stm ^ 1);
+                    upd(&mut self.hist[pos.stm][th(threats, mfrom(tt_move))][mfrom(tt_move)][mto(tt_move)], bonus);
                 }
                 self.stats.tt_cutoffs += 1;
                 return tt_score;
@@ -1631,6 +1646,8 @@ impl Searcher {
         let mut list = MoveList::new();
         let mut scores = Stack256::<i32>::new();
         let us = pos.stm;
+        let threats = pos.attacks_by(pos.stm ^ 1);
+        self.stack[ply].threats = threats;
         let killers = if on(P::UseKillers) { self.killers[ply] } else { [0, 0] };
         // Moves come in stages: the TT move, the noisy moves, the quiets,
         // each generated and scored when the stage before is used up, so a
@@ -1649,7 +1666,7 @@ impl Searcher {
         } else {
             stage = STAGE_NOISY;
             pos.gen(&mut list, GEN_NOISY | GEN_UNDERPROMO);
-            self.score_moves(pos, list.as_slice(), &mut scores, 0, killers, prev1, prev2, prev4, prev6);
+            self.score_moves(pos, list.as_slice(), &mut scores, 0, killers, prev1, prev2, prev4, prev6, threats);
         }
         let mut best_score = -INF;
         let mut best_move = 0;
@@ -1684,6 +1701,7 @@ impl Searcher {
                         prev2,
                         prev4,
                         prev6,
+                        threats,
                     );
                 } else if !skip_quiets {
                     n = self.gen_stage(
@@ -1697,6 +1715,7 @@ impl Searcher {
                         prev2,
                         prev4,
                         prev6,
+                        threats,
                     );
                 }
                 compacted = false;
@@ -1738,6 +1757,7 @@ impl Searcher {
                             prev2,
                             prev4,
                             prev6,
+                            threats,
                         );
                     }
                     continue;
@@ -2007,9 +2027,9 @@ impl Searcher {
                     self.killers[ply][1] = self.killers[ply][0];
                     self.killers[ply][0] = m;
                 }
-                self.update_quiet(pos, m, bonus, prev1, prev2, prev4, prev6);
+                self.update_quiet(pos, m, bonus, prev1, prev2, prev4, prev6, threats);
                 for k in 0..nq {
-                    self.update_quiet(pos, quiets[k], -bonus, prev1, prev2, prev4, prev6);
+                    self.update_quiet(pos, quiets[k], -bonus, prev1, prev2, prev4, prev6, threats);
                 }
             } else {
                 let pc = pos.board[mfrom(m)] as usize;
@@ -2030,7 +2050,8 @@ impl Searcher {
                 let bonus = bonus * tp(P::PriorBonusPct) / 100;
                 let prev3 = if ply >= 3 { self.stack[ply - 3].cont_idx } else { 0 };
                 let prev5 = if ply >= 5 { self.stack[ply - 5].cont_idx } else { 0 };
-                upd(&mut self.hist[pos.stm ^ 1][mfrom(pm)][mto(pm)], bonus);
+                let pt = self.stack[ply - 1].threats;
+                upd(&mut self.hist[pos.stm ^ 1][th(pt, mfrom(pm))][mfrom(pm)][mto(pm)], bonus);
                 // Its continuation entries, as seen from the opponent's node: their
                 // previous moves were ours at ply-2, -3 (theirs) and -5.
                 if prev2 != 0 {
@@ -2081,10 +2102,11 @@ impl Searcher {
         prev2: usize,
         prev4: usize,
         prev6: usize,
+        threats: u64,
     ) {
         let pc = pos.board[mfrom(m)] as usize;
         let ci = pc * 64 + mto(m);
-        upd(&mut self.hist[pos.stm][mfrom(m)][mto(m)], bonus);
+        upd(&mut self.hist[pos.stm][th(threats, mfrom(m))][mfrom(m)][mto(m)], bonus);
         if prev1 != 0 {
             upd_shared(&self.sh.cont[prev1][ci], bonus);
         }
@@ -2117,6 +2139,7 @@ impl Searcher {
         prev2: usize,
         prev4: usize,
         prev6: usize,
+        threats: u64,
     ) -> usize {
         let old = list.len();
         debug_assert_eq!(scores.len(), old);
@@ -2128,7 +2151,7 @@ impl Searcher {
             }
         }
         let n = list.len();
-        self.score_moves(pos, &list.as_slice()[old..n], scores, tt_move, killers, prev1, prev2, prev4, prev6);
+        self.score_moves(pos, &list.as_slice()[old..n], scores, tt_move, killers, prev1, prev2, prev4, prev6, threats);
         n
     }
 
@@ -2145,6 +2168,7 @@ impl Searcher {
         prev2: usize,
         prev4: usize,
         prev6: usize,
+        threats: u64,
     ) {
         let us = pos.stm;
         for &m in moves {
@@ -2175,7 +2199,7 @@ impl Searcher {
             } else {
                 let pc = pos.board[mfrom(m)] as usize;
                 let ci = pc * 64 + mto(m);
-                self.hist[us][mfrom(m)][mto(m)] as i32
+                self.hist[us][th(threats, mfrom(m))][mfrom(m)][mto(m)] as i32
                     + self.sh.cont[prev1][ci].load(Ordering::Relaxed) as i32
                     + self.sh.cont[prev2][ci].load(Ordering::Relaxed) as i32
                     + self.sh.cont[prev4][ci].load(Ordering::Relaxed) as i32 / 2
@@ -2271,7 +2295,7 @@ impl Searcher {
                 (1 << 20) + see_vals()[ct.min(5)] * 16 * (ct < 6) as i32 - see_vals()[pc_type(pc as u8)]
                     + if is_promo(m) { 8000 } else { 0 }
             } else {
-                self.hist[pos.stm][mfrom(m)][mto(m)] as i32
+                self.hist[pos.stm][0][mfrom(m)][mto(m)] as i32
             };
             scores.push(score);
         }

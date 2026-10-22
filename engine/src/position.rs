@@ -440,6 +440,34 @@ impl Position {
             | (rook_attacks(sq, occ) & (self.pieces[ROOK] | self.pieces[QUEEN]))
     }
 
+    /// Every square attacked by colour `c`: pawns by their capture squares,
+    /// sliders through the current occupancy.
+    pub fn attacks_by(&self, c: usize) -> u64 {
+        let occ = self.occ();
+        let p = self.pcs(c, PAWN);
+        let mut a = if c == WHITE {
+            ((p & !FILE_A) << 7) | ((p & !FILE_H) << 9)
+        } else {
+            ((p & !FILE_A) >> 9) | ((p & !FILE_H) >> 7)
+        };
+        let mut b = self.pcs(c, KNIGHT);
+        while b != 0 {
+            a |= knight_attacks(b.trailing_zeros() as usize);
+            b &= b - 1;
+        }
+        let mut b = self.pcs(c, BISHOP) | self.pcs(c, QUEEN);
+        while b != 0 {
+            a |= bishop_attacks(b.trailing_zeros() as usize, occ);
+            b &= b - 1;
+        }
+        let mut b = self.pcs(c, ROOK) | self.pcs(c, QUEEN);
+        while b != 0 {
+            a |= rook_attacks(b.trailing_zeros() as usize, occ);
+            b &= b - 1;
+        }
+        a | king_attacks(self.king_sq(c))
+    }
+
     fn update_castle_touch(&mut self) {
         self.castle_touch = 0;
         for r in 0..4 {
