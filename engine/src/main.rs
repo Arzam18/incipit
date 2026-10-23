@@ -132,8 +132,8 @@ struct Uci {
     lag_prev: Option<(i64, i64, u64, usize)>,
     /// Hash of the last `position` command's base (startpos or the FEN,
     /// before its moves): a different base without ucinewgame means an
-    /// unrelated position (test suites, analysis), so the correction
-    /// history is cleared. None after ucinewgame.
+    /// unrelated position (test suites, analysis), handled as a new game:
+    /// TT and histories are cleared. None after ucinewgame.
     base: Option<u64>,
 }
 
@@ -162,7 +162,8 @@ impl Uci {
             return;
         }
         if self.base.is_some_and(|b| b != pos.hash) {
-            self.searcher.clear_corr();
+            self.searcher.clear();
+            self.pool.each(|s| s.clear());
         }
         self.base = Some(pos.hash);
         self.hist.clear();
