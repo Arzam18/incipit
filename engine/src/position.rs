@@ -326,7 +326,7 @@ impl Position {
         p.update_castle_touch();
         p.halfmove = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
         p.fullmove = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
-        p.hash ^= zob_castle(p.castling);
+        p.hash ^= p.castle_key(p.castling);
         if p.ep != NO_SQ {
             p.hash ^= zob_ep(p.ep as usize % 8);
         }
@@ -495,7 +495,7 @@ impl Position {
         let to = mto(m);
         let flag = mflag(m);
         let pc = self.board[from];
-        self.hash ^= zob_castle(self.castling);
+        let old_castling = self.castling;
         if self.ep != NO_SQ {
             self.hash ^= zob_ep(self.ep as usize & 7);
             self.ep = NO_SQ;
@@ -545,7 +545,9 @@ impl Position {
             }
             self.update_castle_touch();
         }
-        self.hash ^= zob_castle(self.castling);
+        if self.castling != old_castling {
+            self.hash ^= self.castle_key(old_castling) ^ self.castle_key(self.castling);
+        }
         let occ = self.occ();
         if self.attackers_to(self.king_sq(us), occ) & self.colors[them] != 0 {
             return false;
@@ -710,6 +712,20 @@ impl Position {
         let minors = self.pieces[KNIGHT] | self.pieces[BISHOP];
         let b = self.pieces[BISHOP];
         heavy == 0 && (minors.count_ones() <= 1 || (self.pieces[KNIGHT] == 0 && (b & DARK == 0 || b & !DARK == 0)))
+    }
+
+    /// The hash of castling rights `c`: the rights, and in Chess960 which
+    /// rook each one belongs to (zero for the classical rook squares).
+    #[inline]
+    fn castle_key(&self, c: u8) -> u64 {
+        let mut k = zob_castle(c);
+        let mut m = c;
+        while m != 0 {
+            let r = m.trailing_zeros() as usize;
+            k ^= zob_crook(r, self.rook_sq[r] as usize);
+            m &= m - 1;
+        }
+        k
     }
 
     /// Whether the side to move has any legal move (slow; for rare cases).
@@ -968,6 +984,18 @@ pub fn perft(pos: &Position, depth: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chess960: which rook a castling right belongs to is part of the
+    /// position, so it must be part of the hash (with RR on a1/b1, right A
+    /// is blocked by the b1 rook, right B can castle).
+    #[test]
+    fn castling_rook_in_hash() {
+        crate::attacks::init();
+        let a = Position::from_fen("4k3/8/8/8/8/8/8/RR2K3 w A - 0 1").unwrap();
+        let b = Position::from_fen("4k3/8/8/8/8/8/8/RR2K3 w B - 0 1").unwrap();
+        assert_eq!(a.castling, b.castling, "same right bit");
+        assert_ne!(a.hash, b.hash);
+    }
 
     /// Positions from random games out of the perft suite, whose last five
     /// entries are Chess960 positions (kings and rooks off their classical
