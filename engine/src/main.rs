@@ -130,6 +130,11 @@ struct Uci {
     /// The previous move's clock, increment, own time and game length, to
     /// measure the next move's lag from.
     lag_prev: Option<(i64, i64, u64, usize)>,
+    /// Hash of the last `position` command's base (startpos or the FEN,
+    /// before its moves): a different base without ucinewgame means an
+    /// unrelated position (test suites, analysis), so the correction
+    /// history is cleared. None after ucinewgame.
+    base: Option<u64>,
 }
 
 impl Uci {
@@ -156,6 +161,10 @@ impl Uci {
         } else {
             return;
         }
+        if self.base.is_some_and(|b| b != pos.hash) {
+            self.searcher.clear_corr();
+        }
+        self.base = Some(pos.hash);
         self.hist.clear();
         if toks.get(i) == Some(&"moves") {
             for mstr in &toks[i + 1..] {
@@ -623,6 +632,7 @@ fn main() {
         reserve_moves: 0,
         lag_ms: 0.0,
         lag_prev: None,
+        base: None,
     };
     uci.searcher.pt.hit = ponder_hit;
     let mut hash_mb = 16usize;
@@ -657,6 +667,7 @@ fn main() {
             "isready" => println!("readyok"),
             "ucinewgame" => {
                 uci.lag_prev = None;
+                uci.base = None;
                 uci.searcher.clear();
                 uci.pool.each(|s| s.clear());
             }

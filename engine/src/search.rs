@@ -452,6 +452,14 @@ impl SharedHist {
     pub fn clear(&mut self) {
         unsafe { std::ptr::write_bytes(self as *mut SharedHist, 0, 1) }
     }
+    /// Zeroes the correction tables only.
+    fn clear_corr(&mut self) {
+        let z = |t: &mut [AtomicI32]| t.iter_mut().for_each(|x| *x.get_mut() = 0);
+        self.corr.iter_mut().for_each(|t| z(t));
+        self.corr_np.iter_mut().flatten().for_each(|t| z(t));
+        self.corr_cont.iter_mut().for_each(|t| z(t));
+        self.corr_cont2.iter_mut().for_each(|t| z(t));
+    }
 }
 
 /// UCI_ShowWDL: append win/draw/loss permille to info lines.
@@ -649,6 +657,14 @@ impl Searcher {
         Arc::get_mut(&mut self.sh).expect("histories cleared during a search").clear();
         *self.capt = [[[0; 7]; 64]; 12];
         self.killers = Align64([[0; 2]; MAX_PLY + 4]);
+    }
+
+    /// Clears the correction history (shared by all threads), for a search
+    /// of a position unrelated to the previous one without ucinewgame: what
+    /// it learnt about the old game's evals, mate scores especially, would
+    /// skew the new one's.
+    pub fn clear_corr(&mut self) {
+        Arc::get_mut(&mut self.sh).expect("histories cleared during a search").clear_corr();
     }
 
     #[inline(always)]
@@ -2421,6 +2437,27 @@ mod tests {
         s.search_moves.clear();
         let (m, sc) = s.search(&pos, &Limits { soft_ms: None, hard_ms: None, depth: 6, nodes: None });
         assert_eq!((pos.move_uci(m).as_str(), sc), ("d1d8", MATE - 1));
+    }
+
+    /// After a search full of mate scores (a back-rank mate in one), the
+    /// correction history is skewed: an unrelated position searched next
+    /// (no ucinewgame) missed a mate in two (1.Ra6) even at depth 40. The UCI
+    /// layer clears the correction tables when the base position changes;
+    /// this checks the cleared searcher finds the mate.
+    #[test]
+    fn corr_cleared_for_unrelated_position() {
+        crate::attacks::init();
+        crate::nnue::init();
+        let mut s = Searcher::new(16, Arc::new(AtomicBool::new(false)));
+        s.silent = true;
+        let lim = Limits { soft_ms: None, hard_ms: None, depth: 64, nodes: Some(1_000_000) };
+        let first = Position::from_fen("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1").unwrap();
+        let (m, sc) = s.search(&first, &lim);
+        assert_eq!((first.move_uci(m).as_str(), sc), ("a1a8", MATE - 1));
+        s.clear_corr();
+        let pos = Position::from_fen("kbK5/pp6/1P6/8/8/8/8/R7 w - - 0 1").unwrap();
+        let (m, sc) = s.search(&pos, &lim);
+        assert_eq!((pos.move_uci(m).as_str(), sc), ("a1a6", MATE - 3));
     }
 
     /// Printed scores: 100 at the WDL model's 50%-win score, scaled in
