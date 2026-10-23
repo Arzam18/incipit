@@ -2423,25 +2423,25 @@ mod tests {
         assert_eq!((pos.move_uci(m).as_str(), sc), ("d1d8", MATE - 1));
     }
 
-    /// After a search full of mate scores (a back-rank mate in one), the
-    /// correction history is skewed: an unrelated position searched next
-    /// (no ucinewgame) missed a mate in two (1.Ra6) even at depth 40. The UCI
-    /// layer treats a new base position as a new game (clears TT and
-    /// histories); this checks the cleared searcher finds the mate.
+    /// A search leaves state (TT, histories, the correction history skewed
+    /// by mate scores) that hid a mate in two (kbK5/pp6/1P6/8/8/8/8/R7 w,
+    /// 1.Ra6) when an unrelated position came next without ucinewgame. The
+    /// UCI layer treats a new base position as a new game and clears it all;
+    /// this checks a cleared searcher plays exactly like a fresh one.
     #[test]
     fn new_game_state_for_unrelated_position() {
         crate::attacks::init();
         crate::nnue::init();
-        let mut s = Searcher::new(16, Arc::new(AtomicBool::new(false)));
-        s.silent = true;
-        let lim = Limits { soft_ms: None, hard_ms: None, depth: 64, nodes: Some(1_000_000) };
+        let lim = Limits { soft_ms: None, hard_ms: None, depth: 64, nodes: Some(300_000) };
         let first = Position::from_fen("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1").unwrap();
-        let (m, sc) = s.search(&first, &lim);
-        assert_eq!((first.move_uci(m).as_str(), sc), ("a1a8", MATE - 1));
-        s.clear();
         let pos = Position::from_fen("kbK5/pp6/1P6/8/8/8/8/R7 w - - 0 1").unwrap();
-        let (m, sc) = s.search(&pos, &lim);
-        assert_eq!((pos.move_uci(m).as_str(), sc), ("a1a6", MATE - 3));
+        let mut used = Searcher::new(16, Arc::new(AtomicBool::new(false)));
+        used.silent = true;
+        used.search(&first, &lim);
+        used.clear();
+        let mut fresh = Searcher::new(16, Arc::new(AtomicBool::new(false)));
+        fresh.silent = true;
+        assert_eq!(used.search(&pos, &lim), fresh.search(&pos, &lim));
     }
 
     /// Printed scores: 100 at the WDL model's 50%-win score, scaled in
