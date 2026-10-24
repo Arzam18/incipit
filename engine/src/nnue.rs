@@ -1102,22 +1102,87 @@ fn update<const H: usize>(
 /// (`skip[p]` false: the king didn't change bucket or mirror, so the mirror
 /// is the same before and after), v += the rows of the threats the move
 /// adds - those it removes (threats::delta lists only the pieces the move
-/// can affect). One pass per row: measured faster than one fused pass over
-/// all rows (2026-10-24, thrsmoke10 net).
+/// can affect), all in one pass over the accumulator (about 5-6 rows per
+/// side per move); a move that changes more than CAP rows (rare) applies the
+/// rest one pass each.
 #[inline(never)]
 fn update_threats(acc: &mut Acc, n: &Network, h: usize, pos: &Position, child: &Position, skip: [bool; 2]) {
+    const CAP: usize = 64;
     let Some(var) = n.thr else { return };
     let xor = [kinfo(n, 0, child.king_sq(0)).1, kinfo(n, 1, child.king_sq(1)).1];
+    use std::mem::MaybeUninit;
+    // [perspective][add?][row]: only the first cnt entries are written and read.
+    let mut rows = [[[MaybeUninit::<*const i8>::uninit(); CAP]; 2]; 2];
+    let mut cnt = [[0usize; 2]; 2];
     crate::threats::delta(pos, child, |k, add| {
         for p in 0..2 {
             if skip[p] {
                 continue;
             }
             if let Some(f) = crate::threats::index_of(var, k, p, xor[p]) {
-                add_row8(acc.side_mut(p, h), thr_row(n, f, h), add);
+                let (a, c) = (add as usize, &mut cnt[p][add as usize]);
+                if *c < CAP {
+                    let r = thr_row(n, f, h).as_ptr();
+                    prefetch_row(r, h);
+                    rows[p][a][*c] = MaybeUninit::new(r);
+                    *c += 1;
+                } else {
+                    add_row8(acc.side_mut(p, h), thr_row(n, f, h), add);
+                }
             }
         }
     });
+    for p in 0..2 {
+        if cnt[p][0] + cnt[p][1] > 0 {
+            // Safe: the first cnt entries were written, and every pointer
+            // starts an h-long row of the net.
+            unsafe {
+                let init =
+                    |r: &[MaybeUninit<*const i8>]| &*(r as *const [MaybeUninit<*const i8>] as *const [*const i8]);
+                add_sub_rows8_ptr(acc.side_mut(p, h), init(&rows[p][1][..cnt[p][1]]), init(&rows[p][0][..cnt[p][0]]));
+            }
+        }
+    }
+}
+
+/// Starts loading an i8 row of h values into cache.
+#[inline(always)]
+fn prefetch_row(r: *const i8, h: usize) {
+    #[cfg(target_arch = "x86_64")]
+    for o in (0..h).step_by(64) {
+        // Safe: a prefetch never faults, and r + o is within the row.
+        unsafe { std::arch::x86_64::_mm_prefetch(r.add(o), std::arch::x86_64::_MM_HINT_T0) };
+    }
+}
+
+/// v += Σ adds − Σ subs over i8 rows given by pointer, 32 values at a time
+/// (one pass over v for all the rows).
+///
+/// # Safety
+/// Every pointer must point at v.len() values.
+#[inline(always)]
+unsafe fn add_sub_rows8_ptr(v: &mut [i16], adds: &[*const i8], subs: &[*const i8]) {
+    const C: usize = 32;
+    let h = v.len();
+    assert!(h % C == 0);
+    let mut o = 0;
+    while o < h {
+        let mut x: [i16; C] = *(v.as_ptr().add(o) as *const [i16; C]);
+        for &a in adds {
+            let w = &*(a.add(o) as *const [i8; C]);
+            for k in 0..C {
+                x[k] = x[k].wrapping_add(w[k] as i16);
+            }
+        }
+        for &s in subs {
+            let w = &*(s.add(o) as *const [i8; C]);
+            for k in 0..C {
+                x[k] = x[k].wrapping_sub(w[k] as i16);
+            }
+        }
+        *(v.as_mut_ptr().add(o) as *mut [i16; C]) = x;
+        o += C;
+    }
 }
 
 /// `update` for the piece and pawn-pair rows.
