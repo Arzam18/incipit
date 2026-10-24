@@ -48,6 +48,9 @@ const PAWN_SQUARES: u64 = 0x00ff_ffff_ffff_ff00;
 struct Table {
     offset: Box<[[[u32; 10]; 64]; 12]>,
     valid: Box<[[[u64; 10]; 64]; 12]>,
+    // The same, flat: [(attacker * 64 + square) * 10 + victim].
+    offset_flat: Vec<u32>,
+    valid_flat: Vec<u64>,
     count: usize,
 }
 
@@ -120,7 +123,9 @@ fn table(var: usize) -> &'static Table {
                 }
             }
         }
-        Table { offset, valid, count: n as usize }
+        let offset_flat = offset.iter().flatten().flatten().copied().collect();
+        let valid_flat = valid.iter().flatten().flatten().copied().collect();
+        Table { offset, valid, offset_flat, valid_flat, count: n as usize }
     })
 }
 
@@ -186,6 +191,46 @@ pub fn active(var: usize, pos: &Position, persp: usize, xor: usize) -> Vec<usize
     }
     out.sort_unstable();
     out
+}
+
+/// Most active threats a position can have: each piece attacks at most 8
+/// occupied squares (games reach ~65).
+pub const MAX_ACTIVE: usize = 256;
+
+/// The active threat features for perspective `persp` (file mirror `xor`),
+/// into `out` (unsorted); returns the count. No allocation: used by the
+/// accumulator updates.
+#[inline]
+pub fn active_into(var: usize, pos: &Position, persp: usize, xor: usize, out: &mut [u32; MAX_ACTIVE]) -> usize {
+    let flip = if persp == WHITE { 0 } else { 56 };
+    let tb = table(var);
+    let occ = pos.occ();
+    let mut n = 0;
+    let mut bb = occ;
+    while bb != 0 {
+        let s = bb.trailing_zeros() as usize;
+        bb &= bb - 1;
+        let pc = pos.board[s];
+        let ap = (pc_color(pc) ^ persp) * 6 + pc_type(pc);
+        let fs = s ^ flip ^ xor;
+        let mut targets = attacks(pc, s, occ) & occ;
+        while targets != 0 {
+            let t = targets.trailing_zeros() as usize;
+            targets &= targets - 1;
+            let vc = pos.board[t];
+            if pc_type(vc) == KING {
+                continue;
+            }
+            let i = (ap * 64 + fs) * 10 + (pc_color(vc) ^ persp) * 5 + pc_type(vc);
+            let ft = t ^ flip ^ xor;
+            let m = tb.valid_flat[i];
+            if m >> ft & 1 != 0 {
+                out[n] = tb.offset_flat[i] + (m & ((1u64 << ft) - 1)).count_ones();
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// One fixture line: `fen | white-perspective features | black-perspective
@@ -297,6 +342,27 @@ mod tests {
         for var in 0..VARIANTS {
             assert_eq!(active(var, &a, WHITE, 0), active(var, &m, WHITE, 7));
             assert_eq!(active(var, &a, BLACK, 0), active(var, &m, BLACK, 7));
+        }
+    }
+
+    /// The allocation-free version gives the same features as `active`.
+    #[test]
+    fn active_into_matches_active() {
+        crate::attacks::init();
+        let text = include_str!("../tests/threats_fixture.txt");
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let p = Position::from_fen(line.split('|').next().unwrap().trim()).unwrap();
+            for var in 0..VARIANTS {
+                for persp in [WHITE, BLACK] {
+                    for xor in [0, 7] {
+                        let mut out = [0u32; MAX_ACTIVE];
+                        let n = active_into(var, &p, persp, xor, &mut out);
+                        let mut got: Vec<usize> = out[..n].iter().map(|&f| f as usize).collect();
+                        got.sort_unstable();
+                        assert_eq!(got, active(var, &p, persp, xor));
+                    }
+                }
+            }
         }
     }
 

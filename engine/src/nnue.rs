@@ -30,6 +30,25 @@ fn check_ft_range(ftw: &[i16], ftb: &[i16]) -> Result<(), String> {
     Ok(())
 }
 
+/// Threat rows add up to threats::MAX_ACTIVE more rows. Games reach about 65
+/// active threats (datatools threatstats: max 65 in 39M training positions),
+/// so check the sum against a cap of 96 on top of the piece rows: the bound
+/// covers every position play produces, not contrived ones.
+const THREAT_CAP: i32 = 96;
+
+fn check_thr_range(ftw: &[i16], ftb: &[i16], thr: &[i8]) -> Result<(), String> {
+    if thr.is_empty() {
+        return Ok(());
+    }
+    let max16 = |v: &[i16]| v.iter().map(|&x| (x as i32).abs()).max().unwrap_or(0);
+    let t = thr.iter().map(|&x| (x as i32).abs()).max().unwrap_or(0);
+    let bound = 32 * max16(ftw) + max16(ftb) + THREAT_CAP * t;
+    if bound > i16::MAX as i32 {
+        return Err(format!("feature transformer with threat rows up to {} can overflow i16 (bound {})", t, bound));
+    }
+    Ok(())
+}
+
 const MAGIC: &[u8; 8] = b"INCPTNET";
 const TAG_INPUTS: u16 = 0x0001;
 const TAG_KING_BUCKETS: u16 = 0x0002;
@@ -44,6 +63,8 @@ const INPUT_PSQ768: u16 = 1;
 /// rows come once, after all the king buckets' rows. Kinds 2, 3 and 4 are
 /// pair windows 0, 1 and 2.
 const INPUT_PAWN_PAIRS: u16 = 2;
+/// Threat inputs (src/threats.rs): kinds 5, 6, 7 are variants 0, 1, 2.
+const INPUT_THREATS: u16 = 5;
 const ACT_NONE: u8 = 0;
 const ACT_CRELU: u8 = 2;
 const ACT_SCRELU: u8 = 3;
@@ -84,6 +105,10 @@ pub struct Network {
     /// The pawn-pair rows as i8, [pair feature][h]: a pawn move reads half the
     /// bytes. The i16 copies in ftw are clamped to the same values at load.
     ppw8: Vec<i8>,
+    /// Threat inputs (src/threats.rs) of this variant, or None.
+    thr: Option<usize>,
+    /// The threat rows, i8 [threat feature][h], at the FT's scale. Not in ftw.
+    thrw8: Vec<i8>,
     ftb: Aligned, // [h]
     ow: Aligned,  // [output bucket][2h], side to move first
     ob: Vec<i32>, // [output bucket]
@@ -312,22 +337,37 @@ fn load_layers(d: &[u8]) -> Result<Network, String> {
 
     let missing = |name: &str| format!("missing {} field", name);
     let inputs = inputs.ok_or_else(|| missing("INPUTS"))?;
-    let (pp, ppw) = match inputs.as_slice() {
-        [(INPUT_PSQ768, 768)] => (false, 0),
-        [(INPUT_PSQ768, 768), (k, f)]
-            if (INPUT_PAWN_PAIRS..INPUT_PAWN_PAIRS + crate::pawnpairs::WINDOWS as u16).contains(k)
-                && *f as usize == crate::pawnpairs::features((k - INPUT_PAWN_PAIRS) as usize) =>
-        {
-            (true, (k - INPUT_PAWN_PAIRS) as usize)
-        }
-        _ => {
-            return Err(format!(
-                "unsupported inputs {:?} (768 piece-square, optionally pawn pairs: kind 2, 3 or 4 with {:?} features)",
-                inputs,
-                crate::pawnpairs::WINDOW_PAIRS.map(|p| p * 4)
-            ))
-        }
+    // Piece-square, then optionally pawn pairs, then optionally threats.
+    let bad_inputs = || {
+        format!(
+            "unsupported inputs {:?} (768 piece-square, optionally pawn pairs: kind 2, 3 or 4 with {:?} features, then optionally threats: kind 5, 6 or 7 with {:?} features)",
+            inputs,
+            crate::pawnpairs::WINDOW_PAIRS.map(|p| p * 4),
+            crate::threats::VARIANT_FEATURES
+        )
     };
+    let mut rest = match inputs.as_slice() {
+        [(INPUT_PSQ768, 768), rest @ ..] => rest,
+        _ => return Err(bad_inputs()),
+    };
+    let (mut pp, mut ppw, mut thr) = (false, 0, None);
+    if let [(k, f), r @ ..] = rest {
+        if (INPUT_PAWN_PAIRS..INPUT_PAWN_PAIRS + crate::pawnpairs::WINDOWS as u16).contains(k)
+            && *f as usize == crate::pawnpairs::features((k - INPUT_PAWN_PAIRS) as usize)
+        {
+            (pp, ppw, rest) = (true, (k - INPUT_PAWN_PAIRS) as usize, r);
+        }
+    }
+    if let [(k, f), r @ ..] = rest {
+        if (INPUT_THREATS..INPUT_THREATS + crate::threats::VARIANTS as u16).contains(k)
+            && *f as usize == crate::threats::features((k - INPUT_THREATS) as usize)
+        {
+            (thr, rest) = (Some((k - INPUT_THREATS) as usize), r);
+        }
+    }
+    if !rest.is_empty() {
+        return Err(bad_inputs());
+    }
     let (nkb, mirror, king_bucket) = kb.ok_or_else(|| missing("KING_BUCKETS"))?;
     if nkb == 0 || king_bucket.iter().any(|&b| b as usize >= nkb) {
         return Err(format!("king bucket table doesn't match {} bucket(s)", nkb));
@@ -372,10 +412,11 @@ fn load_layers(d: &[u8]) -> Result<Network, String> {
             &layer_quant,
             pp,
             ppw,
+            thr,
         );
     }
-    if pp {
-        return Err("pawn-pair inputs need a hidden layer".into());
+    if pp || thr.is_some() {
+        return Err("pawn-pair and threat inputs need a hidden layer".into());
     }
     let &[(lin, lout, lact, lwt, lbt, lflags)] = layers.as_slice() else {
         return Err(format!("{} layers after the feature transformer; one to three are supported", layers.len()));
@@ -433,6 +474,8 @@ fn load_layers(d: &[u8]) -> Result<Network, String> {
         ppw: 0,
         pp_base: 0,
         ppw8: Vec::new(),
+        thr: None,
+        thrw8: Vec::new(),
         ftb,
         ow,
         ob,
@@ -460,6 +503,7 @@ fn load_hidden(
     layer_quant: &[(u32, i32)],
     pp: bool,
     ppw: usize,
+    thr: Option<usize>,
 ) -> Result<Network, String> {
     let (l1, l2) = (layers[0], layers[layers.len() - 1]);
     // A middle layer: the second hidden layer.
@@ -535,9 +579,12 @@ fn load_hidden(
     }
     // The pawn-pair rows follow the king buckets' rows in the same block.
     let n_ftw = (nkb * 768 + if pp { crate::pawnpairs::features(ppw) } else { 0 }) * h;
+    // Threat rows (i8) come last, after every layer.
+    let n_thr = thr.map_or(0, crate::threats::features) * h;
     let expect = 2 * (n_ftw + h)
         + nb1 * ln * inl
-        + 4 * (nb1 * ln + buckets * n2 * (in2 + 1) + buckets * (last_in + 1) + if lin { buckets * ln } else { 0 });
+        + 4 * (nb1 * ln + buckets * n2 * (in2 + 1) + buckets * (last_in + 1) + if lin { buckets * ln } else { 0 })
+        + n_thr;
     if d.len() - header != expect {
         return Err(format!("weights are {} bytes, but the header describes {}", d.len() - header, expect));
     }
@@ -562,9 +609,12 @@ fn load_hidden(
         }
     }
     o += nb1 * ln * inl;
-    // Everything from here is f32: a NaN or infinity (a corrupt file or a
-    // diverged training run) would load and silently produce nonsense evals.
-    if let Some(k) = d[o..].chunks_exact(4).position(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite()) {
+    // Everything from here to the threat rows is f32: a NaN or infinity (a
+    // corrupt file or a diverged training run) would load and silently
+    // produce nonsense evals.
+    if let Some(k) =
+        d[o..d.len() - n_thr].chunks_exact(4).position(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+    {
         return Err(format!("non-finite float weight at byte {}", o + 4 * k));
     }
     let mut f32s = |n: usize| {
@@ -608,6 +658,8 @@ fn load_hidden(
     };
     let b2 = f32s(buckets);
     let lin = if lin { rows(f32s(buckets * ln)) } else { vec![[0f32; L1_SIZE]; buckets] };
+    let thrw8: Vec<i8> = d[d.len() - n_thr..].iter().map(|&b| b as i8).collect();
+    check_thr_range(&ftw, &ftb, &thrw8)?;
     Ok(Network {
         h,
         mirror,
@@ -626,6 +678,8 @@ fn load_hidden(
         ppw,
         pp_base: nkb * 768,
         ppw8: Vec::new(),
+        thr,
+        thrw8,
         ftb,
         ow: Aligned::from(std::iter::empty()),
         ob: Vec::new(),
@@ -880,6 +934,69 @@ fn refresh_persp<const H: usize>(acc: &mut Acc, n: &Network, p: usize, pos: &Pos
             }
         }
     }
+    add_threats(v, n, h, p, pos, ki.1);
+}
+
+/// Threat feature f's i8 row.
+#[inline(always)]
+fn thr_row(n: &Network, f: u32, h: usize) -> &[i8] {
+    let f = f as usize;
+    &n.thrw8[f * h..(f + 1) * h]
+}
+
+/// v += every active threat row of `pos` for perspective p (mirror xor).
+#[inline]
+fn add_threats(v: &mut [i16], n: &Network, h: usize, p: usize, pos: &Position, xor: usize) {
+    let Some(var) = n.thr else { return };
+    let mut t = [0u32; crate::threats::MAX_ACTIVE];
+    let k = crate::threats::active_into(var, pos, p, xor, &mut t);
+    for &f in &t[..k] {
+        add_row8(v, thr_row(n, f, h), true);
+    }
+}
+
+/// For each perspective whose accumulator `update` built incrementally
+/// (`skip[p]` false: the king didn't change bucket or mirror, so the mirror
+/// is the same before and after), v += the child's threat rows - the
+/// parent's, for the threats that differ. A first, simple version: both
+/// lists in full, sorted, merged.
+#[inline(never)]
+fn update_threats(acc: &mut Acc, n: &Network, h: usize, pos: &Position, child: &Position, skip: [bool; 2]) {
+    let Some(var) = n.thr else { return };
+    for p in 0..2 {
+        if skip[p] {
+            continue;
+        }
+        let xor = kinfo(n, p, child.king_sq(p)).1;
+        let (mut a, mut b) = ([0u32; crate::threats::MAX_ACTIVE], [0u32; crate::threats::MAX_ACTIVE]);
+        let na = crate::threats::active_into(var, pos, p, xor, &mut a);
+        let nb = crate::threats::active_into(var, child, p, xor, &mut b);
+        let (a, b) = (&mut a[..na], &mut b[..nb]);
+        a.sort_unstable();
+        b.sort_unstable();
+        let v = acc.side_mut(p, h);
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() || j < b.len() {
+            if j == b.len() || (i < a.len() && a[i] < b[j]) {
+                add_row8(v, thr_row(n, a[i], h), false);
+                i += 1;
+            } else if i == a.len() || b[j] < a[i] {
+                add_row8(v, thr_row(n, b[j], h), true);
+                j += 1;
+            } else {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+}
+
+/// Whether `update` rebuilds perspective p through the refresh cache: the
+/// side to move's king moved to another bucket or mirror state.
+#[inline(always)]
+fn refreshes(n: &Network, p: usize, pos: &Position, m: Move) -> bool {
+    let pc = pos.board[mfrom(m)];
+    n.refresh_on_king_move && p == pos.stm && pc_type(pc) == KING && kinfo(n, p, mto(m)) != kinfo(n, p, pos.king_sq(p))
 }
 
 /// Rebuilds perspective p of `acc` for `pos` through the cache entry for p's
@@ -924,6 +1041,8 @@ fn refresh_cached<const H: usize>(acc: &mut Acc, n: &Network, p: usize, pos: &Po
         }
     }
     apply_rows(&mut e.acc[..h], acc.side_mut(p, h), n, h, &adds[..na], &subs[..ns]);
+    // Entries hold the piece and pair rows only; the threats go on top.
+    add_threats(acc.side_mut(p, h), n, h, p, pos, ki.1);
 }
 
 /// v += the rows `adds` - the rows `subs`, then out = v. One pass per row.
@@ -1000,6 +1119,24 @@ fn apply_rows(v: &mut [i16], out: &mut [i16], n: &Network, h: usize, adds: &[usi
 
 #[inline(never)]
 fn update<const H: usize>(
+    acc: &mut Acc,
+    n: &Network,
+    parent: &Acc,
+    pos: &Position,
+    child: &Position,
+    m: Move,
+    cache: &mut RefreshCache,
+) {
+    update_pieces::<H>(acc, n, parent, pos, child, m, cache);
+    if n.thr.is_some() {
+        let skip = [refreshes(n, 0, pos, m), refreshes(n, 1, pos, m)];
+        update_threats(acc, n, hidden::<H>(n), pos, child, skip);
+    }
+}
+
+/// `update` for the piece and pawn-pair rows.
+#[inline(always)]
+fn update_pieces<const H: usize>(
     acc: &mut Acc,
     n: &Network,
     parent: &Acc,
@@ -2807,6 +2944,11 @@ mod tests {
     /// mirrored king buckets, optional pawn pairs, 16 -> 16 -> 1, 8 output
     /// buckets. Values are small, so the accumulators' i16 sums don't wrap.
     fn synth_net(pp: Option<usize>, seed: u64) -> Vec<u8> {
+        synth_net_thr(pp, None, seed)
+    }
+
+    /// `synth_net` with threat inputs of variant `thr` (small i8 rows, last).
+    fn synth_net_thr(pp: Option<usize>, thr: Option<usize>, seed: u64) -> Vec<u8> {
         let (h, nkb, nb, l1, l2) = (128usize, 32usize, 8usize, 16usize, 16usize);
         let mut r = seed | 1;
         let mut next = move || {
@@ -2822,10 +2964,13 @@ mod tests {
             out.extend_from_slice(p);
         };
         let mut f = Vec::new();
-        let sets: Vec<(u16, u32)> = match pp {
-            Some(w) => vec![(INPUT_PSQ768, 768), (INPUT_PAWN_PAIRS + w as u16, crate::pawnpairs::features(w) as u32)],
-            None => vec![(INPUT_PSQ768, 768)],
-        };
+        let mut sets: Vec<(u16, u32)> = vec![(INPUT_PSQ768, 768)];
+        if let Some(w) = pp {
+            sets.push((INPUT_PAWN_PAIRS + w as u16, crate::pawnpairs::features(w) as u32));
+        }
+        if let Some(v) = thr {
+            sets.push((INPUT_THREATS + v as u16, crate::threats::features(v) as u32));
+        }
         let mut p = (sets.len() as u16).to_le_bytes().to_vec();
         for (k, c) in &sets {
             p.extend_from_slice(&k.to_le_bytes());
@@ -2875,6 +3020,7 @@ mod tests {
         for _ in 0..n_f32 {
             d.extend_from_slice(&(((next() % 2001) as f32 - 1000.0) / 1000.0).to_le_bytes());
         }
+        d.extend((0..thr.map_or(0, crate::threats::features) * h).map(|_| ((next() % 61) as i32 - 30) as i8 as u8));
         d
     }
 
@@ -2894,10 +3040,11 @@ mod tests {
             "4k3/p1p1p1p1/1p1p1p1p/P1P1P1P1/1P1P1P1P/8/8/4K3 w - - 0 1",
             "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9",
         ];
-        let cases = [None, Some(0), Some(1), Some(2)];
-        for pp in cases {
-            let n = load(&synth_net(pp, 0x1234_5678)).unwrap();
-            assert_eq!((n.pp, n.ppw), (pp.is_some(), pp.unwrap_or(0)));
+        let cases =
+            [(None, None), (Some(0), None), (Some(1), None), (Some(2), None), (Some(2), Some(0)), (None, Some(2))];
+        for (pp, thr) in cases {
+            let n = load(&synth_net_thr(pp, thr, 0x1234_5678)).unwrap();
+            assert_eq!((n.pp, n.ppw, n.thr), (pp.is_some(), pp.unwrap_or(0), thr));
             let mut cache = RefreshCache::with_net(&n);
             let mut seed = 0x9E37_79B9_7F4A_7C15u64;
             let mut checked = 0;
@@ -2934,8 +3081,9 @@ mod tests {
                     }
                     assert!(
                         inc.v[..256] == full.v[..256],
-                        "pawn pairs {:?}: incremental != refresh after {} in {}",
+                        "pawn pairs {:?}, threats {:?}: incremental != refresh after {} in {}",
                         pp,
+                        thr,
                         pos.move_uci(m),
                         pos.to_fen()
                     );
