@@ -51,7 +51,35 @@ struct Table {
     // The same, flat: [(attacker * 64 + square) * 10 + victim].
     offset_flat: Vec<u32>,
     valid_flat: Vec<u64>,
+    slots: Vec<Slot>,
     count: usize,
+}
+
+/// One slot of the flat index table: the valid target squares of an
+/// (attacker, square, victim) in the frame, and the index of the first.
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+pub struct Slot {
+    pub valid: u64,
+    pub offset: u32,
+}
+
+/// The flat index table of variant `var`, by `attacker_slot + victim_slot`.
+pub fn slots(var: usize) -> &'static [Slot] {
+    &table(var).slots
+}
+
+/// The first slot of attacker `pc` on board square `s` for perspective
+/// `persp`, with `fx` = its board flip ^ mirror xor.
+#[inline(always)]
+pub fn attacker_slot(pc: u8, s: usize, persp: usize, fx: usize) -> usize {
+    (((pc_color(pc) ^ persp) * 6 + pc_type(pc)) * 64 + (s ^ fx)) * 10
+}
+
+/// The victim's offset within an attacker's slots.
+#[inline(always)]
+pub fn victim_slot(vc: u8, persp: usize) -> usize {
+    (pc_color(vc) ^ persp) * 5 + pc_type(vc)
 }
 
 /// Empty-board attacks of a piece of relative colour `c` (0 = ours, moving
@@ -123,9 +151,10 @@ fn table(var: usize) -> &'static Table {
                 }
             }
         }
-        let offset_flat = offset.iter().flatten().flatten().copied().collect();
-        let valid_flat = valid.iter().flatten().flatten().copied().collect();
-        Table { offset, valid, offset_flat, valid_flat, count: n as usize }
+        let offset_flat: Vec<u32> = offset.iter().flatten().flatten().copied().collect();
+        let valid_flat: Vec<u64> = valid.iter().flatten().flatten().copied().collect();
+        let slots = valid_flat.iter().zip(&offset_flat).map(|(&valid, &offset)| Slot { valid, offset }).collect();
+        Table { offset, valid, offset_flat, valid_flat, slots, count: n as usize }
     })
 }
 
@@ -279,9 +308,10 @@ fn threats_of(pos: &Position, squares: u64, out: &mut [u32; MAX_ACTIVE]) -> usiz
     n
 }
 
-/// The threats that differ between `pos` and `child`, one move apart,
-/// passed to `f(packed threat, add)`: subtract those only in `pos`, add
-/// those only in `child`.
+/// The threats that differ between `pos` and `child`, one move apart, by
+/// attacker square: `f(square, removed targets, added targets)`; the
+/// attacker and victims of a removed threat are `pos`'s, of an added one
+/// `child`'s.
 ///
 /// A threat changes only if its attacker's piece or attack set changes, or
 /// its victim changes. With C the squares whose contents changed, that
@@ -293,8 +323,8 @@ fn threats_of(pos: &Position, squares: u64, out: &mut [u32; MAX_ACTIVE]) -> usiz
 /// both for targets on C (the victim changed). As bitboards, without
 /// branches on the case: removed = To & (!Tn | C | moved), added = Tn & (!To
 /// | C | moved), moved all ones when s is in C.
-#[inline]
-pub fn delta(pos: &Position, child: &Position, mut f: impl FnMut(u32, bool)) {
+#[inline(always)]
+pub fn delta_masks(pos: &Position, child: &Position, mut f: impl FnMut(usize, u64, u64)) {
     let mut c = (pos.colors[0] ^ child.colors[0]) | (pos.colors[1] ^ child.colors[1]);
     for pt in 0..6 {
         c |= pos.pieces[pt] ^ child.pieces[pt];
@@ -314,23 +344,28 @@ pub fn delta(pos: &Position, child: &Position, mut f: impl FnMut(u32, bool)) {
         let x = s.trailing_zeros() as usize;
         s &= s - 1;
         let bit = 1u64 << x;
-        let (pa, pb) = (pos.board[x], child.board[x]);
-        let to = if occ_a & bit != 0 { attacks(pa, x, occ_a) & vic_a } else { 0 };
-        let tn = if occ_b & bit != 0 { attacks(pb, x, occ_b) & vic_b } else { 0 };
+        let to = if occ_a & bit != 0 { attacks(pos.board[x], x, occ_a) & vic_a } else { 0 };
+        let tn = if occ_b & bit != 0 { attacks(child.board[x], x, occ_b) & vic_b } else { 0 };
         let moved = 0u64.wrapping_sub((c >> x) & 1);
-        let mut rem = to & (!tn | c | moved);
-        let mut add = tn & (!to | c | moved);
+        f(x, to & (!tn | c | moved), tn & (!to | c | moved));
+    }
+}
+
+/// `delta_masks` as packed threats: `f(packed threat, add)`.
+#[inline]
+pub fn delta(pos: &Position, child: &Position, mut f: impl FnMut(u32, bool)) {
+    delta_masks(pos, child, |x, mut rem, mut add| {
         while rem != 0 {
             let t = rem.trailing_zeros() as usize;
             rem &= rem - 1;
-            f(pack(pa, x, t, pos.board[t]), false);
+            f(pack(pos.board[x], x, t, pos.board[t]), false);
         }
         while add != 0 {
             let t = add.trailing_zeros() as usize;
             add &= add - 1;
-            f(pack(pb, x, t, child.board[t]), true);
+            f(pack(child.board[x], x, t, child.board[t]), true);
         }
-    }
+    });
 }
 
 /// One fixture line: `fen | white-perspective features | black-perspective

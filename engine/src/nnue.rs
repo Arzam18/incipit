@@ -1174,13 +1174,40 @@ fn update_thr<const H: usize>(
         }
     }
     // Unchanged king mirror for every perspective built here, so the
-    // parent's xor is the child's.
-    crate::threats::delta(pos, child, |k, add| {
-        for p in 0..2 {
-            if let Some(f) = crate::threats::index_of(var, k, p, ki[p].1) {
-                let r = thr_row(n, f, h).as_ptr();
-                prefetch_row(r, h);
-                push(p, add, r);
+    // parent's xor is the child's. Every target's row pointer is written and
+    // the count advances by its valid bit (no branch on excluded threats).
+    let slots = crate::threats::slots(var);
+    let base = n.thrw8.as_ptr();
+    let fx = [ki[0].1, ki[1].1 ^ 56];
+    crate::threats::delta_masks(pos, child, |x, rem, add| {
+        for (side, ts, b) in [(0, rem, pos), (1, add, child)] {
+            if ts == 0 {
+                continue;
+            }
+            let pc = b.board[x];
+            for p in 0..2 {
+                let a = crate::threats::attacker_slot(pc, x, p, fx[p]);
+                let mut c = cnt[p][side];
+                if c + (ts.count_ones() as usize) > CAP {
+                    full[p] = true;
+                    continue;
+                }
+                let mut t = ts;
+                while t != 0 {
+                    let sq = t.trailing_zeros() as usize;
+                    t &= t - 1;
+                    // Safe: attacker and victim slots stay within the table.
+                    let sl = unsafe { slots.get_unchecked(a + crate::threats::victim_slot(b.board[sq], p)) };
+                    let ft = sq ^ fx[p];
+                    let f = sl.offset + (sl.valid & ((1u64 << ft) - 1)).count_ones();
+                    // In bounds or one row past the end when not valid (then
+                    // never read: the count doesn't advance over it).
+                    let r = base.wrapping_add(f as usize * h);
+                    prefetch_row(r, h);
+                    r8[p][side][c] = MaybeUninit::new(r);
+                    c += (sl.valid >> ft & 1) as usize;
+                }
+                cnt[p][side] = c;
             }
         }
     });
