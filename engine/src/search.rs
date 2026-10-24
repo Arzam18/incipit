@@ -2214,6 +2214,19 @@ impl Searcher {
         prev6: usize,
         threats: u64,
     ) {
+        // Squares from which each piece type of ours gives direct check to
+        // the enemy king, with the current occupancy (a slider moving along
+        // its own line towards or away from the king is missed; rare). Four
+        // attack lookups per call, one bit test per quiet.
+        let check_sq: [u64; 6] = if on(P::UseCheckOrder) {
+            use crate::attacks::{bishop_attacks, knight_attacks, pawn_attacks, rook_attacks};
+            let ksq = pos.king_sq(pos.stm ^ 1);
+            let occ = pos.occ();
+            let (b, r) = (bishop_attacks(ksq, occ), rook_attacks(ksq, occ));
+            [pawn_attacks(pos.stm ^ 1, ksq), knight_attacks(ksq), b, r, b | r, 0]
+        } else {
+            [0; 6]
+        };
         for &m in moves {
             let score = if m == tt_move {
                 1 << 30
@@ -2241,6 +2254,7 @@ impl Searcher {
                 (1 << 27) + 1
             } else {
                 self.quiet_history(pos, m, [prev1, prev2, prev4, prev6], threats)
+                    + if check_sq[pc_type(pos.board[mfrom(m)])] >> mto(m) & 1 != 0 { tp(P::CheckBonus) } else { 0 }
             };
             scores.push(score);
         }
