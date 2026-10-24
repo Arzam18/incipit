@@ -955,42 +955,6 @@ fn add_threats(v: &mut [i16], n: &Network, h: usize, p: usize, pos: &Position, x
     }
 }
 
-/// For each perspective whose accumulator `update` built incrementally
-/// (`skip[p]` false: the king didn't change bucket or mirror, so the mirror
-/// is the same before and after), v += the child's threat rows - the
-/// parent's, for the threats that differ. A first, simple version: both
-/// lists in full, sorted, merged.
-#[inline(never)]
-fn update_threats(acc: &mut Acc, n: &Network, h: usize, pos: &Position, child: &Position, skip: [bool; 2]) {
-    let Some(var) = n.thr else { return };
-    for p in 0..2 {
-        if skip[p] {
-            continue;
-        }
-        let xor = kinfo(n, p, child.king_sq(p)).1;
-        let (mut a, mut b) = ([0u32; crate::threats::MAX_ACTIVE], [0u32; crate::threats::MAX_ACTIVE]);
-        let na = crate::threats::active_into(var, pos, p, xor, &mut a);
-        let nb = crate::threats::active_into(var, child, p, xor, &mut b);
-        let (a, b) = (&mut a[..na], &mut b[..nb]);
-        a.sort_unstable();
-        b.sort_unstable();
-        let v = acc.side_mut(p, h);
-        let (mut i, mut j) = (0, 0);
-        while i < a.len() || j < b.len() {
-            if j == b.len() || (i < a.len() && a[i] < b[j]) {
-                add_row8(v, thr_row(n, a[i], h), false);
-                i += 1;
-            } else if i == a.len() || b[j] < a[i] {
-                add_row8(v, thr_row(n, b[j], h), true);
-                j += 1;
-            } else {
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-}
-
 /// Whether `update` rebuilds perspective p through the refresh cache: the
 /// side to move's king moved to another bucket or mirror state.
 #[inline(always)]
@@ -1132,6 +1096,28 @@ fn update<const H: usize>(
         let skip = [refreshes(n, 0, pos, m), refreshes(n, 1, pos, m)];
         update_threats(acc, n, hidden::<H>(n), pos, child, skip);
     }
+}
+
+/// For each perspective whose accumulator `update` built incrementally
+/// (`skip[p]` false: the king didn't change bucket or mirror, so the mirror
+/// is the same before and after), v += the rows of the threats the move
+/// adds - those it removes (threats::delta lists only the pieces the move
+/// can affect). One pass per row: measured faster than one fused pass over
+/// all rows (2026-10-24, thrsmoke10 net).
+#[inline(never)]
+fn update_threats(acc: &mut Acc, n: &Network, h: usize, pos: &Position, child: &Position, skip: [bool; 2]) {
+    let Some(var) = n.thr else { return };
+    let xor = [kinfo(n, 0, child.king_sq(0)).1, kinfo(n, 1, child.king_sq(1)).1];
+    crate::threats::delta(pos, child, |k, add| {
+        for p in 0..2 {
+            if skip[p] {
+                continue;
+            }
+            if let Some(f) = crate::threats::index_of(var, k, p, xor[p]) {
+                add_row8(acc.side_mut(p, h), thr_row(n, f, h), add);
+            }
+        }
+    });
 }
 
 /// `update` for the piece and pawn-pair rows.

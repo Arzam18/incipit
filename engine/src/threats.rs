@@ -233,6 +233,94 @@ pub fn active_into(var: usize, pos: &Position, persp: usize, xor: usize, out: &m
     n
 }
 
+/// A threat in board terms (attacker piece, its square, target square,
+/// victim piece), packed into one integer so lists sort and compare cheaply.
+#[inline(always)]
+fn pack(pc: u8, s: usize, t: usize, vc: u8) -> u32 {
+    (pc as u32) << 20 | (s as u32) << 14 | (t as u32) << 8 | vc as u32
+}
+
+/// Feature index of a packed threat for perspective `persp` (mirror `xor`),
+/// or None when that threat has no feature in this frame (excluded, or the
+/// merged half of a mutual pair).
+#[inline(always)]
+pub fn index_of(var: usize, k: u32, persp: usize, xor: usize) -> Option<u32> {
+    let flip = if persp == WHITE { 0 } else { 56 };
+    let (pc, s, t, vc) = ((k >> 20) as u8, (k >> 14 & 63) as usize, (k >> 8 & 63) as usize, (k & 255) as u8);
+    let tb = table(var);
+    let i = (((pc_color(pc) ^ persp) * 6 + pc_type(pc)) * 64 + (s ^ flip ^ xor)) * 10
+        + (pc_color(vc) ^ persp) * 5
+        + pc_type(vc);
+    let ft = t ^ flip ^ xor;
+    let m = tb.valid_flat[i];
+    (m >> ft & 1 != 0).then(|| tb.offset_flat[i] + (m & ((1u64 << ft) - 1)).count_ones())
+}
+
+/// The packed threats of the pieces on `squares` in `pos`, into `out`,
+/// sorted; returns the count. King victims are skipped (never features).
+#[inline]
+fn threats_of(pos: &Position, squares: u64, out: &mut [u32; MAX_ACTIVE]) -> usize {
+    let occ = pos.occ();
+    let mut n = 0;
+    let mut bb = squares & occ;
+    while bb != 0 {
+        let s = bb.trailing_zeros() as usize;
+        bb &= bb - 1;
+        let pc = pos.board[s];
+        let mut targets = attacks(pc, s, occ) & occ & !pos.pieces[KING];
+        while targets != 0 {
+            let t = targets.trailing_zeros() as usize;
+            targets &= targets - 1;
+            out[n] = pack(pc, s, t, pos.board[t]);
+            n += 1;
+        }
+    }
+    out[..n].sort_unstable();
+    n
+}
+
+/// The threats that differ between `pos` and `child`, one move apart,
+/// passed to `f(packed threat, add)`: subtract those only in `pos`, add
+/// those only in `child`.
+///
+/// A threat changes only if its attacker's piece or attack set changes, or
+/// its victim changes. With C the squares whose contents changed, that
+/// means the attacker stands on C (before or after) or attacks a square of
+/// C (before or after: sliders whose rays pass through C, and any piece
+/// whose victim is on C). So only those pieces' threats are listed, in both
+/// positions, and the lists merged.
+#[inline]
+pub fn delta(pos: &Position, child: &Position, mut f: impl FnMut(u32, bool)) {
+    let mut c = (pos.colors[0] ^ child.colors[0]) | (pos.colors[1] ^ child.colors[1]);
+    for pt in 0..6 {
+        c |= pos.pieces[pt] ^ child.pieces[pt];
+    }
+    let (occ_a, occ_b) = (pos.occ(), child.occ());
+    let mut s = c;
+    let mut sq = c;
+    while sq != 0 {
+        let x = sq.trailing_zeros() as usize;
+        sq &= sq - 1;
+        s |= pos.attackers_to(x, occ_a) | child.attackers_to(x, occ_b);
+    }
+    let (mut a, mut b) = ([0u32; MAX_ACTIVE], [0u32; MAX_ACTIVE]);
+    let na = threats_of(pos, s, &mut a);
+    let nb = threats_of(child, s, &mut b);
+    let (mut i, mut j) = (0, 0);
+    while i < na || j < nb {
+        if j == nb || (i < na && a[i] < b[j]) {
+            f(a[i], false);
+            i += 1;
+        } else if i == na || b[j] < a[i] {
+            f(b[j], true);
+            j += 1;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+}
+
 /// One fixture line: `fen | white-perspective features | black-perspective
 /// features`, for a mirrored net. The trainer's test reads the same lines.
 pub fn fixture_line(var: usize, pos: &Position) -> String {
@@ -364,6 +452,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `delta` gives exactly the difference of the full feature lists, for
+    /// both perspectives and mirror states, over random games (captures,
+    /// en passant, promotions, castling incl. Chess960).
+    #[test]
+    fn delta_matches_full_lists() {
+        use crate::position::MoveList;
+        crate::attacks::init();
+        let starts = [
+            START_FEN,
+            "r3k2r/1pp2pp1/p2p3p/4p3/4P3/P2P3P/1PP2PP1/R3K2R w KQkq - 0 1",
+            "8/2P1P3/8/8/8/8/3p1p2/k6K w - - 0 1",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9",
+            "r1b1k1nr/1pq2ppp/p1nbp3/8/3NP3/2N1B3/PPP1BPPP/R2QK2R w KQkq - 4 9",
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut checked = 0;
+        for g in 0..80 {
+            let mut pos = Position::from_fen(starts[g % starts.len()]).unwrap();
+            for _ in 0..120 {
+                let mut list = MoveList::new();
+                pos.gen_moves(&mut list, false);
+                let legal: Vec<_> = (0..list.len()).map(|i| list[i]).filter(|&m| pos.clone().make_move(m)).collect();
+                if legal.is_empty() {
+                    break;
+                }
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let m = legal[(seed % legal.len() as u64) as usize];
+                let mut child = pos;
+                child.make_move(m);
+                for var in 0..VARIANTS {
+                    for persp in [WHITE, BLACK] {
+                        for xor in [0, 7] {
+                            let mut got = active(var, &pos, persp, xor);
+                            delta(&pos, &child, |k, add| {
+                                if let Some(f) = index_of(var, k, persp, xor) {
+                                    let f = f as usize;
+                                    if add {
+                                        got.push(f);
+                                    } else {
+                                        let i = got.iter().position(|&x| x == f).expect("subtracted feature is active");
+                                        got.swap_remove(i);
+                                    }
+                                }
+                            });
+                            got.sort_unstable();
+                            assert_eq!(
+                                got,
+                                active(var, &child, persp, xor),
+                                "after {} in {}",
+                                pos.move_uci(m),
+                                pos.to_fen()
+                            );
+                        }
+                    }
+                }
+                checked += 1;
+                pos = child;
+            }
+        }
+        assert!(checked > 5000, "only {checked}");
     }
 
     /// The checked-in fixture matches (the trainer's tests check the same file).
