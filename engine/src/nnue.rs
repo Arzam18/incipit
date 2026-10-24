@@ -83,7 +83,20 @@ pub const L2_MAX: usize = 32;
 const OUTPUT_MATERIAL: u8 = 1;
 
 // Path chosen by build.rs (EVALFILE, or the net named in net.txt).
-static NET_BYTES: &[u8] = include_bytes!(env!("INCIPIT_NET"));
+const NET_LEN: usize = include_bytes!(env!("INCIPIT_NET")).len();
+
+/// The embedded net, placed so that it ends on a 64-byte boundary: threat
+/// rows (used in place, a multiple of 64 bytes, last in the file) then start
+/// on cache lines.
+#[repr(C, align(64))]
+struct Embedded {
+    _pad: [u8; (64 - NET_LEN % 64) % 64],
+    bytes: [u8; NET_LEN],
+}
+
+static EMBEDDED: Embedded =
+    Embedded { _pad: [0; (64 - NET_LEN % 64) % 64], bytes: *include_bytes!(env!("INCIPIT_NET")) };
+static NET_BYTES: &[u8] = &EMBEDDED.bytes;
 
 pub struct Network {
     h: usize,
@@ -108,7 +121,7 @@ pub struct Network {
     /// Threat inputs (src/threats.rs) of this variant, or None.
     thr: Option<usize>,
     /// The threat rows, i8 [threat feature][h], at the FT's scale. Not in ftw.
-    thrw8: Vec<i8>,
+    thrw8: AlignedI8,
     ftb: Aligned, // [h]
     ow: Aligned,  // [output bucket][2h], side to move first
     ob: Vec<i32>, // [output bucket]
@@ -148,20 +161,62 @@ struct Hidden {
     wo: Vec<[f32; L2_MAX]>,
 }
 
-/// A 64-byte-aligned i8 buffer.
+/// Layout for a weight buffer of `bytes` bytes: 64-byte aligned, or for
+/// buffers of 2 MB and more, whole 2 MB pages so they can be hugepages.
+fn weight_layout(bytes: usize) -> std::alloc::Layout {
+    const HUGE: usize = 2 << 20;
+    if bytes >= HUGE {
+        std::alloc::Layout::from_size_align(bytes.div_ceil(HUGE) * HUGE, HUGE).unwrap()
+    } else {
+        std::alloc::Layout::from_size_align(bytes.max(1), 64).unwrap()
+    }
+}
+
+/// Allocates a weight buffer (see weight_layout). Large ones are marked for
+/// transparent hugepages before first touch, so rows spread over a big
+/// table cost few TLB entries (Linux; elsewhere, and on failure, normal pages).
+fn alloc_weights(bytes: usize, zeroed: bool) -> *mut u8 {
+    let l = weight_layout(bytes);
+    let ptr = unsafe {
+        if zeroed {
+            std::alloc::alloc_zeroed(l)
+        } else {
+            std::alloc::alloc(l)
+        }
+    };
+    assert!(!ptr.is_null(), "out of memory loading the network");
+    #[cfg(target_os = "linux")]
+    if l.align() > 64 {
+        extern "C" {
+            fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        }
+        const MADV_HUGEPAGE: i32 = 14;
+        unsafe { madvise(ptr, l.size(), MADV_HUGEPAGE) };
+    }
+    ptr
+}
+
+/// A 64-byte-aligned i8 buffer, or a view of the embedded net's bytes.
 struct AlignedI8 {
     ptr: *mut i8,
     len: usize,
+    owned: bool,
 }
 
 impl AlignedI8 {
-    fn layout(len: usize) -> std::alloc::Layout {
-        std::alloc::Layout::from_size_align(len.max(1), 64).unwrap()
-    }
     fn zeroed(len: usize) -> AlignedI8 {
-        let ptr = unsafe { std::alloc::alloc_zeroed(Self::layout(len)) } as *mut i8;
-        assert!(!ptr.is_null(), "out of memory loading the network");
-        AlignedI8 { ptr, len }
+        AlignedI8 { ptr: alloc_weights(len, true) as *mut i8, len, owned: true }
+    }
+    /// A view of static bytes (the embedded net): every process running the
+    /// same binary shares these pages, so concurrent engines share caches.
+    fn view(bytes: &'static [u8]) -> AlignedI8 {
+        AlignedI8 { ptr: bytes.as_ptr() as *mut i8, len: bytes.len(), owned: false }
+    }
+    fn from(bytes: &[u8]) -> AlignedI8 {
+        let ptr = alloc_weights(bytes.len(), false);
+        // Safe: the buffer holds bytes.len() bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        AlignedI8 { ptr: ptr as *mut i8, len: bytes.len(), owned: true }
     }
 }
 
@@ -180,7 +235,9 @@ impl std::ops::DerefMut for AlignedI8 {
 
 impl Drop for AlignedI8 {
     fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr as *mut u8, Self::layout(self.len)) }
+        if self.owned {
+            unsafe { std::alloc::dealloc(self.ptr as *mut u8, weight_layout(self.len)) }
+        }
     }
 }
 
@@ -194,14 +251,9 @@ struct Aligned {
 }
 
 impl Aligned {
-    fn layout(len: usize) -> std::alloc::Layout {
-        std::alloc::Layout::from_size_align(len.max(1) * 2, 64).unwrap()
-    }
-
     fn from(values: impl ExactSizeIterator<Item = i16>) -> Aligned {
         let len = values.len();
-        let ptr = unsafe { std::alloc::alloc(Self::layout(len)) } as *mut i16;
-        assert!(!ptr.is_null(), "out of memory loading the network");
+        let ptr = alloc_weights(len * 2, false) as *mut i16;
         for (i, v) in values.enumerate() {
             unsafe { ptr.add(i).write(v) };
         }
@@ -218,7 +270,7 @@ impl std::ops::Deref for Aligned {
 
 impl Drop for Aligned {
     fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr as *mut u8, Self::layout(self.len)) }
+        unsafe { std::alloc::dealloc(self.ptr as *mut u8, weight_layout(self.len * 2)) }
     }
 }
 
@@ -239,7 +291,15 @@ pub fn init() {
 
 fn init_net() {
     match load(NET_BYTES) {
-        Ok(net) => unsafe { NET = Box::into_raw(Box::new(net)) },
+        Ok(mut net) => {
+            // Threat rows are stored as-is at the end of the file: use them
+            // in place, shared by every process of this binary.
+            let t = net.thrw8.len();
+            if t > 0 {
+                net.thrw8 = AlignedI8::view(&NET_BYTES[NET_BYTES.len() - t..]);
+            }
+            unsafe { NET = Box::into_raw(Box::new(net)) }
+        }
         Err(e) => {
             eprintln!("error: embedded network: {}", e);
             std::process::exit(1);
@@ -477,7 +537,7 @@ fn load_layers(d: &[u8]) -> Result<Network, String> {
         pp_base: 0,
         ppw8: Vec::new(),
         thr: None,
-        thrw8: Vec::new(),
+        thrw8: AlignedI8::zeroed(0),
         ftb,
         ow,
         ob,
@@ -661,7 +721,7 @@ fn load_hidden(
     };
     let b2 = f32s(buckets);
     let lin = if lin { rows(f32s(buckets * ln)) } else { vec![[0f32; L1_SIZE]; buckets] };
-    let thrw8: Vec<i8> = d[d.len() - n_thr..].iter().map(|&b| b as i8).collect();
+    let thrw8 = AlignedI8::from(&d[d.len() - n_thr..]);
     check_thr_range(&ftw, &ftb, &thrw8)?;
     Ok(Network {
         h,
