@@ -1144,8 +1144,14 @@ fn update_thr<const H: usize>(
         subs[1] = (pos.board[to], to);
         ns = 2;
     }
-    let mut full = [refreshes(n, 0, pos, m), refreshes(n, 1, pos, m)];
     let ki = [kinfo(n, 0, pos.king_sq(0)), kinfo(n, 1, pos.king_sq(1))];
+    // A king changing bucket keeps its threats when its mirror state stays:
+    // that perspective is built from the cache entries instead (below).
+    let bucket = [refreshes(n, 0, pos, m), refreshes(n, 1, pos, m)];
+    let mut full = [false; 2];
+    for p in 0..2 {
+        full[p] = bucket[p] && kinfo(n, p, to).1 != ki[p].1;
+    }
     // [perspective][add?][row]: only the first cnt entries are written and read.
     let mut r8 = [[[MaybeUninit::<*const i8>::uninit(); CAP]; 2]; 2];
     let mut cnt = [[0usize; 2]; 2];
@@ -1162,7 +1168,9 @@ fn update_thr<const H: usize>(
         let old = (pos.pcs(WHITE, PAWN), pos.pcs(BLACK, PAWN));
         let new = (child.pcs(WHITE, PAWN), child.pcs(BLACK, PAWN));
         for p in 0..2 {
-            crate::pawnpairs::delta(n.ppw, old, new, p, ki[p].1, |f, add| push(p, add, row8(n, f, h).as_ptr()));
+            if !bucket[p] {
+                crate::pawnpairs::delta(n.ppw, old, new, p, ki[p].1, |f, add| push(p, add, row8(n, f, h).as_ptr()));
+            }
         }
     }
     // Unchanged king mirror for every perspective built here, so the
@@ -1179,6 +1187,28 @@ fn update_thr<const H: usize>(
     for p in 0..2 {
         if full[p] {
             refresh_cached::<H>(acc, n, p, child, cache);
+            continue;
+        }
+        if bucket[p] {
+            // child = its pieces and pairs (the new bucket's entry) + the
+            // parent's threats (parent - the old bucket's entry, synced to
+            // the parent) + the threats that change.
+            let old = sync_entry(n, h, p, pos, cache);
+            let new = sync_entry(n, h, p, child, cache);
+            // Safe: as below; the two entries are distinct (different buckets).
+            unsafe {
+                let init =
+                    |r: &[MaybeUninit<*const i8>]| &*(r as *const [MaybeUninit<*const i8>] as *const [*const i8]);
+                (n.rows)(
+                    acc.side_mut(p, h).as_mut_ptr(),
+                    new,
+                    h,
+                    &[parent.side(p, h).as_ptr()],
+                    &[old],
+                    init(&r8[p][1][..cnt[p][1]]),
+                    init(&r8[p][0][..cnt[p][0]]),
+                );
+            }
             continue;
         }
         let k = ki[p];
@@ -1205,6 +1235,46 @@ fn update_thr<const H: usize>(
             );
         }
     }
+}
+
+/// Brings perspective p's refresh-cache entry for pos's king bucket and mirror
+/// state up to pos's pieces and pawn pairs, in place, and returns its values.
+#[inline(always)]
+fn sync_entry(n: &Network, h: usize, p: usize, pos: &Position, cache: &mut RefreshCache) -> *const i16 {
+    let ki = kinfo(n, p, pos.king_sq(p));
+    let idx = (p * n.nkb + ki.0 / 768) * 2 + (ki.1 != 0) as usize;
+    let e = &mut cache.entries[idx];
+    if n.pp {
+        let old = (e.bb[make_pc(PAWN, WHITE) as usize], e.bb[make_pc(PAWN, BLACK) as usize]);
+        let new = (pos.pcs(WHITE, PAWN), pos.pcs(BLACK, PAWN));
+        if old != new {
+            let v = &mut e.acc[..h];
+            crate::pawnpairs::delta(n.ppw, old, new, p, ki.1, |f, add| add_row8(v, row8(n, f, h), add));
+        }
+    }
+    let mut adds = [std::ptr::null::<i16>(); 32];
+    let mut subs = [std::ptr::null::<i16>(); 32];
+    let (mut na, mut ns) = (0, 0);
+    for c in 0..2 {
+        for pt in 0..6 {
+            let pc = make_pc(pt, c);
+            let cur = pos.pieces[pt] & pos.colors[c];
+            let old = e.bb[pc as usize];
+            for sq in Bits(cur & !old) {
+                adds[na] = row(n, feat(p, ki, pc, sq), h).as_ptr();
+                na += 1;
+            }
+            for sq in Bits(old & !cur) {
+                subs[ns] = row(n, feat(p, ki, pc, sq), h).as_ptr();
+                ns += 1;
+            }
+            e.bb[pc as usize] = cur;
+        }
+    }
+    // Safe: in place (each block is loaded before it is stored); every row
+    // holds h values.
+    unsafe { (n.rows)(e.acc.as_mut_ptr(), e.acc.as_ptr(), h, &adds[..na], &subs[..ns], &[], &[]) };
+    e.acc.as_ptr()
 }
 
 /// dst = src + Σ a16 − Σ s16 + Σ a8 − Σ s8 over i16 and i8 rows given by
