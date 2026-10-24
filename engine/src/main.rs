@@ -10,6 +10,8 @@ mod san;
 mod search;
 mod smp;
 mod tb;
+#[allow(dead_code)]
+mod threats;
 mod tt;
 mod uci;
 use position::*;
@@ -452,6 +454,21 @@ fn main() {
                 for fen in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
                     match Position::from_fen(fen) {
                         Some(p) => println!("{}", pawnpairs::fixture_line(w, &p)),
+                        None => eprintln!("skipped invalid FEN: {}", fen),
+                    }
+                }
+                return;
+            }
+            "threats-fixture" if args.len() >= 3 => {
+                // Developer tool: threat fixture lines (fen | white features |
+                // black features) for each FEN in the file, variant 0.
+                let text = std::fs::read_to_string(&args[2]).unwrap_or_else(|e| {
+                    eprintln!("{}: {}", args[2], e);
+                    std::process::exit(2);
+                });
+                for fen in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    match Position::from_fen(fen) {
+                        Some(p) => println!("{}", threats::fixture_line(0, &p)),
                         None => eprintln!("skipped invalid FEN: {}", fen),
                     }
                 }

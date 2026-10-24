@@ -25,8 +25,14 @@ mod params {
     }
 }
 #[allow(dead_code)]
+#[path = "../../engine/src/pawnpairs.rs"]
+mod pawnpairs;
+#[allow(dead_code)]
 #[path = "../../engine/src/tb.rs"]
 mod tb;
+#[allow(dead_code)]
+#[path = "../../engine/src/threats.rs"]
+mod threats;
 
 mod netfmt;
 mod oldbin;
@@ -103,6 +109,7 @@ fn main() {
         Some("tbstats") if args.len() >= 4 => cmd_tbstats(&args[2], &args[3..]),
         Some("wdlstats") if args.len() >= 4 => cmd_wdlstats(&args[2], &args[3..]),
         Some("piecestats") if args.len() >= 3 => cmd_piecestats(&args[2..]),
+        Some("threatstats") if args.len() >= 4 => cmd_threatstats(&args[2], &args[3..]),
         Some("matstats") if args.len() >= 4 => cmd_matstats(&args[2], &args[3..]),
         Some("bishopstats") if args.len() >= 4 => cmd_bishopstats(&args[2], &args[3..]),
         Some("wdlfit") if args.len() >= 3 => cmd_wdlfit(&args[2]),
@@ -379,6 +386,66 @@ fn cmd_piecestats(inputs: &[String]) -> Result<(), String> {
             println!("{},{},{:.4}", n, c, c as f64 / total as f64);
         }
     }
+    Ok(())
+}
+
+/// Threat inputs (engine/src/threats.rs) over the positions training uses
+/// (scored, not in check, ply >= 16, quiet move), both perspectives with
+/// mirroring: the distribution of active features per perspective (sets the
+/// trainer's maximum and the accumulator's overflow bound) and how often each
+/// feature fires (features that never fire get no gradient).
+fn cmd_threatstats(variant: &str, inputs: &[String]) -> Result<(), String> {
+    let var: usize = variant.parse().ok().filter(|&v| v < threats::VARIANTS).ok_or("variant must be 0, 1 or 2")?;
+    let mut hits = vec![0u64; threats::features(var)];
+    let mut per = vec![0u64; 257];
+    let mut n = 0u64;
+    for input in inputs {
+        let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
+        viri::for_each_position(&data, |pos, m, score, _| {
+            let ply = 2 * (pos.fullmove as i32 - 1) + (pos.stm != position::WHITE) as i32;
+            if score == viri::NO_SCORE || pos.checkers != 0 || ply < 16 || position::is_noisy(m) {
+                return;
+            }
+            for p in [position::WHITE, position::BLACK] {
+                let a = threats::active(var, pos, p, pawnpairs::mirror_xor(pos, p));
+                per[a.len().min(256)] += 1;
+                for f in a {
+                    hits[f] += 1;
+                }
+            }
+            n += 1;
+        })?;
+    }
+    let views = 2 * n;
+    let mut cum = 0u64;
+    let (mut p50, mut p99, mut p9999, mut max) = (0, 0, 0, 0);
+    for (k, &c) in per.iter().enumerate() {
+        if c > 0 {
+            max = k;
+        }
+        cum += c;
+        if p50 == 0 && cum * 2 >= views {
+            p50 = k;
+        }
+        if p99 == 0 && cum * 100 >= views * 99 {
+            p99 = k;
+        }
+        if p9999 == 0 && cum * 10000 >= views * 9999 {
+            p9999 = k;
+        }
+    }
+    let mean = per.iter().enumerate().map(|(k, &c)| k as f64 * c as f64).sum::<f64>() / views.max(1) as f64;
+    println!("variant {} features {}: {} positions, {} perspective views", var, hits.len(), n, views);
+    println!("active per view: mean {:.1}, median {}, p99 {}, p99.99 {}, max {}", mean, p50, p99, p9999, max);
+    let never = hits.iter().filter(|&&h| h == 0).count();
+    let rare = hits.iter().filter(|&&h| h > 0 && h < 100).count();
+    println!(
+        "features never active: {} ({:.1}%), active in fewer than 100 views: {} ({:.1}%)",
+        never,
+        100.0 * never as f64 / hits.len() as f64,
+        rare,
+        100.0 * rare as f64 / hits.len() as f64
+    );
     Ok(())
 }
 

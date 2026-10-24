@@ -1,0 +1,316 @@
+// Threat input features (design: incipit-research docs/threat-features.md).
+//
+// One binary input per (attacker, attacker square, target square, victim):
+// the attacker's attack set in the current position (sliders stop at the
+// first piece, pins ignored, pawns by their diagonal captures only) contains
+// the target square, which holds the victim. The victim may be either
+// colour (attack or defence) but never a king. Seen from a perspective as for
+// the piece inputs: squares in that perspective's frame (ranks flipped for
+// black, files mirrored when the net mirrors and that side's king is on
+// files e-h), colours as ours (0) / theirs (1).
+//
+// Left out, so they get no index:
+// - pawns on ranks 1 and 8, as attacker or victim;
+// - a king attacking an enemy piece that would attack the king back from
+//   where it stands (the position is illegal or in check, and training
+//   filters checks);
+// - the lower-value half of a mutual pair: when the victim also attacks the
+//   attacker's square (rook and rook on a line, queen and bishop on a
+//   diagonal, opposing pawns, ...), the two features always fire together
+//   (a slider's path is the same both ways), so one feature carries both.
+//   The attacker of higher value keeps it; of equal value, the attacker on
+//   the lower frame square. Values: pawn 1, knight 3, bishop 3, rook 5,
+//   queen 9;
+// - by variant, one-way attacks of a lower-value piece on a higher-value
+//   enemy piece:
+//     0 (B): none, 56,890 features;
+//     1 (D): knight attacking queen, 56,218 features;
+//     2 (E): every lower-value attacker on a higher-value enemy, 54,090.
+//
+// Index = offset[attacker][square][victim] + the number of valid target
+// squares below the target, where attacker = colour * 6 + type (12) and
+// victim = colour * 5 + type (10, no kings). The trainer computes the same
+// features; tests/threats_fixture.txt pins the exact indices for both sides.
+use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
+use crate::position::*;
+use std::sync::OnceLock;
+
+/// Number of variants.
+pub const VARIANTS: usize = 3;
+/// Features in each variant.
+pub const VARIANT_FEATURES: [usize; VARIANTS] = [56_890, 56_218, 54_090];
+
+const VALUE: [u32; 6] = [1, 3, 3, 5, 9, 100];
+const PAWN_SQUARES: u64 = 0x00ff_ffff_ffff_ff00;
+
+/// Index tables for one variant: per (attacker, square, victim) the first
+/// index and the bitboard of valid target squares.
+struct Table {
+    offset: Box<[[[u32; 10]; 64]; 12]>,
+    valid: Box<[[[u64; 10]; 64]; 12]>,
+    count: usize,
+}
+
+/// Empty-board attacks of a piece of relative colour `c` (0 = ours, moving
+/// up the frame) and type `pt` from frame square `s`.
+fn empty_attacks(c: usize, pt: usize, s: usize) -> u64 {
+    match pt {
+        PAWN => pawn_attacks(c, s),
+        KNIGHT => knight_attacks(s),
+        BISHOP => bishop_attacks(s, 0),
+        ROOK => rook_attacks(s, 0),
+        QUEEN => bishop_attacks(s, 0) | rook_attacks(s, 0),
+        _ => king_attacks(s),
+    }
+}
+
+/// Whether (attacker colour ca, type a, square s, target t, victim colour cv,
+/// type v) is a feature before deduplication, in variant `var`.
+fn allowed(var: usize, ca: usize, a: usize, s: usize, t: usize, cv: usize, v: usize) -> bool {
+    if v == KING || (a == PAWN && PAWN_SQUARES >> s & 1 == 0) || (v == PAWN && PAWN_SQUARES >> t & 1 == 0) {
+        return false;
+    }
+    if empty_attacks(ca, a, s) >> t & 1 == 0 {
+        return false;
+    }
+    let enemy = ca != cv;
+    if a == KING && enemy && empty_attacks(cv, v, t) >> s & 1 != 0 {
+        return false;
+    }
+    if enemy && a != KING && VALUE[a] < VALUE[v] {
+        let one_way = empty_attacks(cv, v, t) >> s & 1 == 0;
+        match var {
+            1 if one_way && a == KNIGHT && v == QUEEN => return false,
+            2 if one_way => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether an allowed feature is the kept half of its pair (or has none).
+fn kept(var: usize, ca: usize, a: usize, s: usize, t: usize, cv: usize, v: usize) -> bool {
+    if !allowed(var, cv, v, t, s, ca, a) {
+        return true; // no reverse feature: nothing to merge with
+    }
+    debug_assert!(empty_attacks(cv, v, t) >> s & 1 != 0);
+    VALUE[a] > VALUE[v] || (VALUE[a] == VALUE[v] && s < t)
+}
+
+fn table(var: usize) -> &'static Table {
+    static T: [OnceLock<Table>; VARIANTS] = [const { OnceLock::new() }; VARIANTS];
+    T[var].get_or_init(|| {
+        let mut offset = Box::new([[[0u32; 10]; 64]; 12]);
+        let mut valid = Box::new([[[0u64; 10]; 64]; 12]);
+        let mut n = 0u32;
+        for ap in 0..12 {
+            let (ca, a) = (ap / 6, ap % 6);
+            for s in 0..64 {
+                for vp in 0..10 {
+                    let (cv, v) = (vp / 5, vp % 5);
+                    let mut m = 0u64;
+                    for t in 0..64 {
+                        if allowed(var, ca, a, s, t, cv, v) && kept(var, ca, a, s, t, cv, v) {
+                            m |= 1 << t;
+                        }
+                    }
+                    offset[ap][s][vp] = n;
+                    valid[ap][s][vp] = m;
+                    n += m.count_ones();
+                }
+            }
+        }
+        Table { offset, valid, count: n as usize }
+    })
+}
+
+/// Number of features in variant `var` (from the table; a test checks it
+/// against VARIANT_FEATURES).
+pub fn features(var: usize) -> usize {
+    table(var).count
+}
+
+/// Feature index in variant `var` for frame squares and relative colours, or
+/// None if that combination has no feature.
+#[inline]
+pub fn feature(var: usize, ca: usize, a: usize, s: usize, t: usize, cv: usize, v: usize) -> Option<usize> {
+    if v == KING {
+        return None;
+    }
+    let tb = table(var);
+    let (ap, vp) = (ca * 6 + a, cv * 5 + v);
+    let m = tb.valid[ap][s][vp];
+    (m >> t & 1 != 0).then(|| tb.offset[ap][s][vp] as usize + (m & ((1u64 << t) - 1)).count_ones() as usize)
+}
+
+/// The squares piece `pc` on `sq` attacks with occupancy `occ`.
+#[inline]
+fn attacks(pc: u8, sq: usize, occ: u64) -> u64 {
+    match pc_type(pc) {
+        PAWN => pawn_attacks(pc_color(pc), sq),
+        KNIGHT => knight_attacks(sq),
+        BISHOP => bishop_attacks(sq, occ),
+        ROOK => rook_attacks(sq, occ),
+        QUEEN => bishop_attacks(sq, occ) | rook_attacks(sq, occ),
+        _ => king_attacks(sq),
+    }
+}
+
+/// The active threat features of a position for perspective `persp` (file
+/// mirror `xor`, as for pawn pairs), sorted.
+pub fn active(var: usize, pos: &Position, persp: usize, xor: usize) -> Vec<usize> {
+    let flip = if persp == WHITE { 0 } else { 56 };
+    let occ = pos.occ();
+    let mut out = Vec::new();
+    let mut bb = occ;
+    while bb != 0 {
+        let s = bb.trailing_zeros() as usize;
+        bb &= bb - 1;
+        let pc = pos.board[s];
+        let mut targets = attacks(pc, s, occ) & occ;
+        while targets != 0 {
+            let t = targets.trailing_zeros() as usize;
+            targets &= targets - 1;
+            let vc = pos.board[t];
+            let f = feature(
+                var,
+                pc_color(pc) ^ persp,
+                pc_type(pc),
+                s ^ flip ^ xor,
+                t ^ flip ^ xor,
+                pc_color(vc) ^ persp,
+                pc_type(vc),
+            );
+            out.extend(f);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// One fixture line: `fen | white-perspective features | black-perspective
+/// features`, for a mirrored net. The trainer's test reads the same lines.
+pub fn fixture_line(var: usize, pos: &Position) -> String {
+    let side = |p| {
+        let xor = crate::pawnpairs::mirror_xor(pos, p);
+        active(var, pos, p, xor).iter().map(|f| f.to_string()).collect::<Vec<_>>().join(" ")
+    };
+    format!("{} | {} | {}", pos.to_fen(), side(WHITE), side(BLACK))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pos(fen: &str) -> Position {
+        crate::attacks::init();
+        Position::from_fen(fen).unwrap()
+    }
+
+    /// Counts match the design note (scripts/threat_count_dedupe.py), and
+    /// indices are a bijection onto 0..count.
+    #[test]
+    fn counts_and_bijection() {
+        crate::attacks::init();
+        for var in 0..VARIANTS {
+            assert_eq!(features(var), VARIANT_FEATURES[var], "variant {var}");
+            let mut seen = vec![false; features(var)];
+            for ap in 0..12 {
+                for s in 0..64 {
+                    for t in 0..64 {
+                        for vp in 0..10 {
+                            if let Some(f) = feature(var, ap / 6, ap % 6, s, t, vp / 5, vp % 5) {
+                                assert!(!seen[f], "index {f} used twice");
+                                seen[f] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&x| x));
+        }
+    }
+
+    /// Mutual pairs are merged and the exclusions hold, in frame squares
+    /// (a1 = 0, ours moving up).
+    #[test]
+    fn exclusions_and_merges() {
+        crate::attacks::init();
+        let (a1, a2, b3, c3, d4, e4, d5, e5, f6) = (0, 8, 17, 18, 27, 28, 35, 36, 45);
+        // Rook a1 and enemy rook a2: one feature, the lower square's.
+        assert!(feature(0, 0, ROOK, a1, a2, 1, ROOK).is_some());
+        assert!(feature(0, 1, ROOK, a2, a1, 0, ROOK).is_none());
+        // Our pawn d4 attacks their bishop e5: merged into the bishop's attack.
+        assert!(feature(0, 0, PAWN, d4, e5, 1, BISHOP).is_none());
+        assert!(feature(0, 1, BISHOP, e5, d4, 0, PAWN).is_some());
+        // Our pawn d4 attacks their rook e5: one-way, kept in B and D, gone in E.
+        assert!(feature(0, 0, PAWN, d4, e5, 1, ROOK).is_some());
+        assert!(feature(1, 0, PAWN, d4, e5, 1, ROOK).is_some());
+        assert!(feature(2, 0, PAWN, d4, e5, 1, ROOK).is_none());
+        // Our knight d4 attacks their queen e6 (44): one-way, gone in D.
+        assert!(feature(0, 0, KNIGHT, d4, 44, 1, QUEEN).is_some());
+        assert!(feature(1, 0, KNIGHT, d4, 44, 1, QUEEN).is_none());
+        // Pawns are never on rank 1, kings never victims.
+        assert!(feature(0, 1, KNIGHT, b3, a1, 0, PAWN).is_none());
+        assert!(feature(0, 0, QUEEN, d4, d5, 1, KING).is_none());
+        // Our king d4 attacks their knight e5: fine; their queen e5: in check.
+        assert!(feature(0, 0, KING, d4, e5, 1, KNIGHT).is_some());
+        assert!(feature(0, 0, KING, d4, e5, 1, QUEEN).is_none());
+        // Their pawn e5 would check our king d4 (it attacks d4): excluded;
+        // their pawn d5 in front of the king doesn't: kept.
+        assert!(feature(0, 0, KING, d4, e5, 1, PAWN).is_none());
+        assert!(feature(0, 0, KING, d4, d5, 1, PAWN).is_some());
+        // A king defending its own queen keeps the feature (no king victims, so
+        // no reverse feature to merge with).
+        assert!(feature(0, 0, KING, d4, e4, 0, QUEEN).is_some());
+        // Our bishop c3 attacks their knight f6: one-way, kept.
+        assert!(feature(0, 0, BISHOP, c3, f6, 1, KNIGHT).is_some());
+    }
+
+    /// The start position: knights defend d2/e2 pawns etc. Both sides see the
+    /// same features.
+    #[test]
+    fn start_position_symmetry() {
+        let p = pos(START_FEN);
+        let a = active(0, &p, WHITE, crate::pawnpairs::mirror_xor(&p, WHITE));
+        let b = active(0, &p, BLACK, crate::pawnpairs::mirror_xor(&p, BLACK));
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
+    }
+
+    /// Colour-swapped, rank-flipped positions look the same from the other side.
+    #[test]
+    fn colour_flip_swaps_perspectives() {
+        let a = pos("r3k2r/1bq1nppp/p3p3/1p1nP3/3P4/P1N2N2/1P2BPPP/R2Q1RK1 w kq - 0 1");
+        let b = pos("r2q1rk1/1p2bppp/p1n2n2/3p4/1P1Np3/P3P3/1BQ1NPPP/R3K2R b KQ - 0 1");
+        for var in 0..VARIANTS {
+            assert_eq!(active(var, &a, WHITE, 0), active(var, &b, BLACK, 0));
+            assert_eq!(active(var, &a, BLACK, 0), active(var, &b, WHITE, 0));
+        }
+    }
+
+    /// Mirroring the board left-right with mirror xor 7 gives the same features.
+    #[test]
+    fn mirror_invariance() {
+        let a = pos("r3k2r/1bq1nppp/p3p3/1p1nP3/3P4/P1N2N2/1P2BPPP/R2Q1RK1 w kq - 0 1");
+        let m = pos("r2k3r/pppn1qb1/3p3p/3Pn1p1/4P3/2N2N1P/PPPB2P1/1KR1Q2R w - - 0 1");
+        for var in 0..VARIANTS {
+            assert_eq!(active(var, &a, WHITE, 0), active(var, &m, WHITE, 7));
+            assert_eq!(active(var, &a, BLACK, 0), active(var, &m, BLACK, 7));
+        }
+    }
+
+    /// The checked-in fixture matches (the trainer's tests check the same file).
+    #[test]
+    fn fixture_matches() {
+        crate::attacks::init();
+        let text = include_str!("../tests/threats_fixture.txt");
+        let mut n = 0;
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let p = Position::from_fen(line.split('|').next().unwrap().trim()).unwrap();
+            assert_eq!(fixture_line(0, &p), line);
+            n += 1;
+        }
+        assert!(n >= 50);
+    }
+}
