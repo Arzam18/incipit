@@ -30,6 +30,10 @@ pub const INPUT_PSQ768: u16 = 1;
 pub const INPUT_PAWN_PAIRS: u16 = 2;
 /// Features in each pair window.
 pub const PAWN_PAIR_WINDOW_FEATURES: [usize; 3] = [1488, 928, 608];
+/// Threat inputs (the engine's src/threats.rs): kinds 5, 6 and 7 are variants
+/// 0, 1 and 2. Their rows are i8 at the FT's scale, shared by every king
+/// bucket, and stored after all the layers' weights.
+pub const INPUT_THREATS: u16 = 5;
 pub const ACT_NONE: u8 = 0;
 pub const ACT_CRELU: u8 = 2;
 pub const ACT_SCRELU: u8 = 3;
@@ -81,6 +85,8 @@ pub struct Arch {
     pub l1_shift: u32,
     /// Neurons in a second hidden layer (f32, SCReLU, per bucket; 0 = none).
     pub l2: usize,
+    /// Threat inputs of this variant (trainer thr=), hidden-layer nets only.
+    pub threats: Option<usize>,
 }
 
 impl Arch {
@@ -95,6 +101,11 @@ impl Arch {
         } else {
             0
         }
+    }
+
+    /// Threat feature rows (0 without threats).
+    pub fn threat_features(&self) -> usize {
+        self.threats.map_or(0, crate::threats::features)
     }
 }
 
@@ -148,8 +159,10 @@ pub fn write_hidden(
     w2: &[f32],
     b2: &[f32],
     lin: &[f32],
+    thr: &[i8],
 ) -> Vec<u8> {
     let (h, nb, l1, l2) = (arch.hidden, arch.output_buckets, arch.l1, arch.l2);
+    assert_eq!(thr.len(), arch.threat_features() * h);
     let nb1 = if arch.l1_shared { 1 } else { nb };
     let last = if l2 > 0 { l2 } else { l1 };
     // Hidden-layer inputs: 2h (SCReLU) or h (pairwise).
@@ -191,6 +204,8 @@ pub fn write_hidden(
     for v in b1.iter().chain(wm).chain(bm).chain(w2).chain(b2).chain(lin) {
         weights.extend_from_slice(&v.to_le_bytes());
     }
+    // Threat rows last: i8, [feature][h].
+    weights.extend(thr.iter().map(|&v| v as u8));
     if l2 > 0 {
         for v in [0i32, 0] {
             lq.extend_from_slice(&v.to_le_bytes());
@@ -217,13 +232,15 @@ fn assemble(
 
     let mut fields = Vec::new();
     let mut p = Vec::new();
-    let sets: &[(u16, u32)] = if arch.pawn_pairs {
-        &[(INPUT_PSQ768, 768), (INPUT_PAWN_PAIRS + arch.pawn_pair_window as u16, pp as u32)]
-    } else {
-        &[(INPUT_PSQ768, 768)]
-    };
+    let mut sets: Vec<(u16, u32)> = vec![(INPUT_PSQ768, 768)];
+    if arch.pawn_pairs {
+        sets.push((INPUT_PAWN_PAIRS + arch.pawn_pair_window as u16, pp as u32));
+    }
+    if let Some(v) = arch.threats {
+        sets.push((INPUT_THREATS + v as u16, arch.threat_features() as u32));
+    }
     p.extend_from_slice(&(sets.len() as u16).to_le_bytes());
-    for &(kind, count) in sets {
+    for &(kind, count) in &sets {
         p.extend_from_slice(&kind.to_le_bytes());
         p.extend_from_slice(&0u16.to_le_bytes());
         p.extend_from_slice(&count.to_le_bytes());
@@ -283,8 +300,8 @@ pub fn convert(arch: &Arch, source: &str, data: &[u8]) -> Result<Vec<u8>, String
     if arch.l1 > 0 {
         return convert_hidden(arch, source, data);
     }
-    if arch.pawn_pairs {
-        return Err("--pawn-pairs needs a hidden layer (--l1)".into());
+    if arch.pawn_pairs || arch.threats.is_some() {
+        return Err("--pawn-pairs and --threats need a hidden layer (--l1)".into());
     }
     let (h, nkb, nb) = (arch.hidden, arch.num_king_buckets(), arch.output_buckets);
     let n_ftw = nkb * 768 * h;
@@ -333,8 +350,8 @@ pub fn convert(arch: &Arch, source: &str, data: &[u8]) -> Result<Vec<u8>, String
 }
 
 /// Bullet's quantised.bin for a net with one hidden layer: [l0w i16][l0b i16]
-/// [l1w i8, [bucket * l1][2h]][l1b f32][l2w f32, [bucket][l1]][l2b f32], padded
-/// to 64 bytes.
+/// [l1w i8, [bucket * l1][2h]][l1b f32][l2w f32, [bucket][l1]][l2b f32], then
+/// (trainer thr=) the threat rows [l0t i8, [feature][h]], padded to 64 bytes.
 fn convert_hidden(arch: &Arch, source: &str, data: &[u8]) -> Result<Vec<u8>, String> {
     if source != "bullet" {
         return Err("--l1 needs a bullet source".into());
@@ -364,7 +381,9 @@ fn convert_hidden(arch: &Arch, source: &str, data: &[u8]) -> Result<Vec<u8>, Str
     if nlin > l1 {
         return Err(format!("--l1-lin {} is more than the {} hidden neurons", nlin, l1));
     }
-    let expect = 2 * (n_ftw + h) + nb1 * l1 * inl + 4 * (nb1 * l1 + nb * l2 * (in2 + 1) + nb * last + nb + nb * nlin);
+    let n_thr = arch.threat_features() * h;
+    let expect =
+        2 * (n_ftw + h) + nb1 * l1 * inl + 4 * (nb1 * l1 + nb * l2 * (in2 + 1) + nb * last + nb + nb * nlin) + n_thr;
     let ok = data.len() == expect.div_ceil(64) * 64
         && (data[expect..].iter().all(|&b| b == 0)
             || data[expect..].iter().zip(b"bullet".iter().cycle()).all(|(a, b)| a == b));
@@ -402,9 +421,10 @@ fn convert_hidden(arch: &Arch, source: &str, data: &[u8]) -> Result<Vec<u8>, Str
     } else {
         (0..nb * l1).map(|i| if i % l1 < nlin { linf[i / l1 * nlin + i % l1] } else { 0.0 }).collect()
     };
+    let thr: Vec<i8> = take(n_thr).iter().map(|&b| b as i8).collect();
     let mid = (l2 > 0).then_some((&wm[..], &bm[..]));
     if arch.perm.is_empty() {
-        return Ok(write_hidden(arch, &ftw, &ftb, &w1, &b1, mid, &w2, &b2, &lin));
+        return Ok(write_hidden(arch, &ftw, &ftb, &w1, &b1, mid, &w2, &b2, &lin, &thr));
     }
     // The order covers the hidden layer's inputs per perspective: h neurons, or
     // for pairwise nets h/2 pairs (neurons j and j + h/2 move together).
@@ -417,11 +437,12 @@ fn convert_hidden(arch: &Arch, source: &str, data: &[u8]) -> Result<Vec<u8>, Str
     let full: Vec<usize> = if pw { p.iter().copied().chain(p.iter().map(|&i| i + u)).collect() } else { p.clone() };
     let ftw: Vec<i16> = ftw.chunks_exact(h).flat_map(|row| full.iter().map(move |&i| row[i])).collect();
     let ftb: Vec<i16> = full.iter().map(|&i| ftb[i]).collect();
+    let thr: Vec<i8> = thr.chunks_exact(h).flat_map(|row| full.iter().map(move |&i| row[i])).collect();
     let w1: Vec<i8> = w1
         .chunks_exact(2 * u)
         .flat_map(|row| p.iter().map(move |&i| row[i]).chain(p.iter().map(move |&i| row[u + i])))
         .collect();
-    Ok(write_hidden(arch, &ftw, &ftb, &w1, &b1, mid, &w2, &b2, &lin))
+    Ok(write_hidden(arch, &ftw, &ftb, &w1, &b1, mid, &w2, &b2, &lin, &thr))
 }
 
 /// Describes a network file's header (and checks its size), for `net-info`.
@@ -473,6 +494,9 @@ pub fn describe(data: &[u8]) -> Result<String, String> {
                             INPUT_PAWN_PAIRS => "pawn pairs",
                             3 => "pawn pairs, window 1",
                             4 => "pawn pairs, window 2",
+                            5 => "threats, variant 0",
+                            6 => "threats, variant 1",
+                            7 => "threats, variant 2",
                             _ => "unknown",
                         };
                         format!("{} ({}, {} features)", kind, name, p32(6 + 8 * i))
@@ -558,6 +582,7 @@ mod tests {
             pawn_pair_window: 0,
             perm: Vec::new(),
             l1_shift: 0,
+            threats: None,
             l2: 16,
         }
     }
@@ -591,6 +616,7 @@ mod tests {
         for v in b1.iter().chain(&wm).chain(&bm).chain(&w2).chain(&b2).chain(&linf) {
             d.extend_from_slice(&v.to_le_bytes());
         }
+        d.extend((0..a.threat_features() * h).map(|i| ((i % 251) as i32 - 125) as i8 as u8));
         while d.len() % 64 != 0 {
             d.push(0);
         }
@@ -628,7 +654,7 @@ mod tests {
         let (nb, l1, nlin) = (a.output_buckets, a.l1, a.l1_lin);
         let lin: Vec<f32> =
             (0..nb * l1).map(|i| if i % l1 < nlin { linf[i / l1 * nlin + i % l1] } else { 0.0 }).collect();
-        assert_eq!(net, write_hidden(&a, &ftw, &ftb, &w1, &b1, Some((&wm, &bm)), &w2, &b2, &lin));
+        assert_eq!(net, write_hidden(&a, &ftw, &ftb, &w1, &b1, Some((&wm, &bm)), &w2, &b2, &lin, &[]));
         // A reversing permutation reverses every row, the pair rows included.
         let h = a.hidden;
         let mut rev = a.clone();
@@ -644,6 +670,47 @@ mod tests {
         assert!(convert(&a, "bullet", &dp).is_err());
     }
 
+    /// Threats: the i8 rows after the layers are read and written last (the
+    /// file grows by exactly features x h bytes), INPUTS lists the set, a
+    /// permutation moves the threat rows' neurons too, and a file without the
+    /// rows is rejected.
+    #[test]
+    fn threats_round_trip() {
+        crate::attacks::init();
+        let mut a = arch();
+        a.pawn_pairs = true;
+        a.pawn_pair_window = 2;
+        let mut t = a.clone();
+        t.threats = Some(0);
+        let (d, ..) = bullet_file(&a);
+        let (dt, ..) = bullet_file(&t);
+        let base = convert(&a, "bullet", &d).unwrap();
+        let net = convert(&t, "bullet", &dt).unwrap();
+        let hdr = |n: &[u8]| u32::from_le_bytes(n[12..16].try_into().unwrap()) as usize;
+        let (h, nt) = (t.hidden, t.threat_features());
+        assert_eq!(nt, 56_890);
+        assert_eq!(net.len() - hdr(&net), base.len() - hdr(&base) + nt * h);
+        // Everything before the threat rows is the net without threats.
+        assert_eq!(&net[hdr(&net)..net.len() - nt * h], &base[hdr(&base)..]);
+        let row = |i: usize| -> Vec<i8> { (i * h..(i + 1) * h).map(|j| ((j % 251) as i32 - 125) as i8).collect() };
+        let got = |n: &[u8], i: usize| -> Vec<i8> {
+            let o = n.len() - nt * h + i * h;
+            n[o..o + h].iter().map(|&b| b as i8).collect()
+        };
+        assert_eq!(got(&net, nt - 1), row(nt - 1));
+        let info = describe(&net).unwrap();
+        assert!(info.contains("3 set(s)") && info.contains("5 (threats, variant 0, 56890 features)"), "{info}");
+        // A reversing permutation reverses the threat rows too.
+        let mut rev = t.clone();
+        rev.perm = (0..h / 2).rev().collect();
+        let net_rev = convert(&rev, "bullet", &dt).unwrap();
+        let full: Vec<usize> = rev.perm.iter().copied().chain(rev.perm.iter().map(|&i| i + h / 2)).collect();
+        let want: Vec<i8> = full.iter().map(|&i| row(7)[i]).collect();
+        assert_eq!(got(&net_rev, 7), want);
+        // The file without threat rows is too short.
+        assert!(convert(&t, "bullet", &d).is_err());
+    }
+
     /// Converting a Bullet file gives exactly what write_hidden writes from
     /// the same blocks (readout padded to [bucket][l1]); the header describes
     /// what was asked for; an identity permutation changes nothing; a short
@@ -656,7 +723,7 @@ mod tests {
         let (nb, l1, nlin) = (a.output_buckets, a.l1, a.l1_lin);
         let lin: Vec<f32> =
             (0..nb * l1).map(|i| if i % l1 < nlin { linf[i / l1 * nlin + i % l1] } else { 0.0 }).collect();
-        let direct = write_hidden(&a, &ftw, &ftb, &w1, &b1, Some((&wm, &bm)), &w2, &b2, &lin);
+        let direct = write_hidden(&a, &ftw, &ftb, &w1, &b1, Some((&wm, &bm)), &w2, &b2, &lin, &[]);
         assert_eq!(net, direct);
         let info = describe(&net).unwrap();
         for want in ["QA 255, QB 128, scale 400", "king buckets: 4, mirrored: true", "2 buckets", "description: test"] {

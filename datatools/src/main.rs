@@ -91,6 +91,7 @@ usage:
       --pawn-pair-window N pawn pairs in window N: 0 = 1488 rows (as --pawn-pairs), 1 = 928
                            (same file any distance, adjacent files within one rank), 2 = 608
                            (within one rank) (trainer pp=1 ppw=N)
+      --threats V          threat inputs of variant V (0, 1, 2; trainer thr=V): i8 rows after all layers
       --l1-skip            the hidden layer's last neuron is a linear skip to the output (trainer l1skip=1; needs --l2)
       --description TEXT   training run, data and settings
       --permute FILE       FT neuron order (hidden-layer nets; from the engine's l1perm)
@@ -769,6 +770,7 @@ fn cmd_net(source: &str, input: &str, out_dir: &str, opts: &[String]) -> Result<
         perm: Vec::new(),
         l1_shift: 0,
         l2: 0,
+        threats: None,
     };
     let mut qb_set = false;
     let mut i = 0;
@@ -814,6 +816,13 @@ fn cmd_net(source: &str, input: &str, out_dir: &str, opts: &[String]) -> Result<
         let num = || val.parse::<i64>().map_err(|_| format!("{}: bad number {}", flag, val));
         match flag {
             "--l1-lin" => arch.l1_lin = num()? as usize,
+            "--threats" => {
+                let v = num()? as usize;
+                if v >= threats::VARIANTS {
+                    return Err("--threats needs 0, 1 or 2".into());
+                }
+                arch.threats = Some(v);
+            }
             "--hidden" => arch.hidden = num()? as usize,
             "--l1" => arch.l1 = num()? as usize,
             "--l1-shift" => arch.l1_shift = num()? as u32,

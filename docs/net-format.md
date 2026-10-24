@@ -45,8 +45,11 @@ weights appear in each king bucket's block.
 Kinds: `1` = piece-square (768 features: `colour·384 + piece·64 + square`,
 from the perspective's point of view; see [Inputs](#inputs)); `2`, `3`, `4` =
 pawn pairs in windows 0, 1, 2 (1488, 928 and 608 features, see
-[Pawn pairs](#pawn-pairs)). Threat features will be a new
-kind. Pawn pairs are shared by every king bucket: their rows are not repeated
+[Pawn pairs](#pawn-pairs)); `5`, `6`, `7` = threats in variants 0, 1, 2
+(56,890, 56,218 and 54,090 features, defined in `engine/src/threats.rs`).
+Threat rows are i8 at the FT's scale QA, `[feature][hidden]`, shared by every
+king bucket, and stored after all the layers' weights (the FT's i16 block is
+unchanged). Pawn pairs are shared by every king bucket: their rows are not repeated
 per bucket but come once, after all the king buckets' rows (hidden-layer nets
 only).
 
