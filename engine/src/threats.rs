@@ -287,8 +287,12 @@ fn threats_of(pos: &Position, squares: u64, out: &mut [u32; MAX_ACTIVE]) -> usiz
 /// its victim changes. With C the squares whose contents changed, that
 /// means the attacker stands on C (before or after) or attacks a square of
 /// C (before or after: sliders whose rays pass through C, and any piece
-/// whose victim is on C). So only those pieces' threats are listed, in both
-/// positions, and the lists merged.
+/// whose victim is on C). For each such square s, with To and Tn its
+/// targets before and after: an attacker that changed (s in C) loses all of
+/// To and gains all of Tn; otherwise it loses To \ Tn, gains Tn \ To, and
+/// both for targets on C (the victim changed). As bitboards, without
+/// branches on the case: removed = To & (!Tn | C | moved), added = Tn & (!To
+/// | C | moved), moved all ones when s is in C.
 #[inline]
 pub fn delta(pos: &Position, child: &Position, mut f: impl FnMut(u32, bool)) {
     let mut c = (pos.colors[0] ^ child.colors[0]) | (pos.colors[1] ^ child.colors[1]);
@@ -296,6 +300,8 @@ pub fn delta(pos: &Position, child: &Position, mut f: impl FnMut(u32, bool)) {
         c |= pos.pieces[pt] ^ child.pieces[pt];
     }
     let (occ_a, occ_b) = (pos.occ(), child.occ());
+    // Targets: occupied squares other than kings (never victims).
+    let (vic_a, vic_b) = (occ_a & !pos.pieces[KING], occ_b & !child.pieces[KING]);
     let mut s = c;
     let mut sq = c;
     while sq != 0 {
@@ -303,20 +309,26 @@ pub fn delta(pos: &Position, child: &Position, mut f: impl FnMut(u32, bool)) {
         sq &= sq - 1;
         s |= pos.attackers_to(x, occ_a) | child.attackers_to(x, occ_b);
     }
-    let (mut a, mut b) = ([0u32; MAX_ACTIVE], [0u32; MAX_ACTIVE]);
-    let na = threats_of(pos, s, &mut a);
-    let nb = threats_of(child, s, &mut b);
-    let (mut i, mut j) = (0, 0);
-    while i < na || j < nb {
-        if j == nb || (i < na && a[i] < b[j]) {
-            f(a[i], false);
-            i += 1;
-        } else if i == na || b[j] < a[i] {
-            f(b[j], true);
-            j += 1;
-        } else {
-            i += 1;
-            j += 1;
+    s &= occ_a | occ_b;
+    while s != 0 {
+        let x = s.trailing_zeros() as usize;
+        s &= s - 1;
+        let bit = 1u64 << x;
+        let (pa, pb) = (pos.board[x], child.board[x]);
+        let to = if occ_a & bit != 0 { attacks(pa, x, occ_a) & vic_a } else { 0 };
+        let tn = if occ_b & bit != 0 { attacks(pb, x, occ_b) & vic_b } else { 0 };
+        let moved = 0u64.wrapping_sub((c >> x) & 1);
+        let mut rem = to & (!tn | c | moved);
+        let mut add = tn & (!to | c | moved);
+        while rem != 0 {
+            let t = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            f(pack(pa, x, t, pos.board[t]), false);
+        }
+        while add != 0 {
+            let t = add.trailing_zeros() as usize;
+            add &= add - 1;
+            f(pack(pb, x, t, child.board[t]), true);
         }
     }
 }
