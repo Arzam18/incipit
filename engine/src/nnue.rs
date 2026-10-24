@@ -114,6 +114,7 @@ pub struct Network {
     ob: Vec<i32>, // [output bucket]
     l1: Option<Hidden>,
     eval: EvalFn, // chosen by pick_eval at load
+    rows: RowsFn, // chosen by pick_rows at load
 }
 
 /// One hidden layer between the feature transformer and the output: the FT
@@ -257,6 +258,7 @@ pub fn load(d: &[u8]) -> Result<Network, String> {
         n.ppw8 = n.ftw[start..].iter().map(|&w| w as i8).collect();
     }
     n.eval = pick_eval(&n);
+    n.rows = pick_rows();
     Ok(n)
 }
 
@@ -481,6 +483,7 @@ fn load_layers(d: &[u8]) -> Result<Network, String> {
         ob,
         l1: None,
         eval: eval_n_entry::<0>, // replaced by load()
+        rows: rows_base,
     })
 }
 
@@ -703,6 +706,7 @@ fn load_hidden(
             wo,
         }),
         eval: eval_n_entry::<0>, // replaced by load()
+        rows: rows_base,
     })
 }
 
@@ -1091,97 +1095,320 @@ fn update<const H: usize>(
     m: Move,
     cache: &mut RefreshCache,
 ) {
-    update_pieces::<H>(acc, n, parent, pos, child, m, cache);
     if n.thr.is_some() {
-        let skip = [refreshes(n, 0, pos, m), refreshes(n, 1, pos, m)];
-        update_threats(acc, n, hidden::<H>(n), pos, child, skip);
+        update_thr::<H>(acc, n, parent, pos, child, m, cache);
+    } else {
+        update_pieces::<H>(acc, n, parent, pos, child, m, cache);
     }
 }
 
-/// For each perspective whose accumulator `update` built incrementally
-/// (`skip[p]` false: the king didn't change bucket or mirror, so the mirror
-/// is the same before and after), v += the rows of the threats the move
-/// adds - those it removes (threats::delta lists only the pieces the move
-/// can affect), all in one pass over the accumulator (about 5-6 rows per
-/// side per move); a move that changes more than CAP rows (rare) applies the
-/// rest one pass each.
+/// `update` for a net with threat inputs: per perspective, the move's piece
+/// rows, the pawn pairs that change and the threats that change, all applied
+/// in one pass from the parent's accumulator by the load-time row kernel.
+/// A perspective whose king changes bucket or mirror state, or (rarely) with
+/// more than CAP rows of one sign, is rebuilt through the refresh cache.
 #[inline(never)]
-fn update_threats(acc: &mut Acc, n: &Network, h: usize, pos: &Position, child: &Position, skip: [bool; 2]) {
-    const CAP: usize = 64;
-    let Some(var) = n.thr else { return };
-    let xor = [kinfo(n, 0, child.king_sq(0)).1, kinfo(n, 1, child.king_sq(1)).1];
+fn update_thr<const H: usize>(
+    acc: &mut Acc,
+    n: &Network,
+    parent: &Acc,
+    pos: &Position,
+    child: &Position,
+    m: Move,
+    cache: &mut RefreshCache,
+) {
     use std::mem::MaybeUninit;
+    const CAP: usize = 64;
+    let h = hidden::<H>(n);
+    let var = n.thr.unwrap_or(0);
+    let from = mfrom(m);
+    let to = mto(m);
+    let flag = mflag(m);
+    let pc = pos.board[from];
+    let us = pos.stm;
+    let newpc = if flag & 8 != 0 { make_pc(promo_pt(m), us) } else { pc };
+    let mut adds: [(u8, usize); 2] = [(newpc, to), (0, 64)];
+    let mut subs: [(u8, usize); 2] = [(pc, from), (0, 64)];
+    let mut na = 1;
+    let mut ns = 1;
+    if is_castle(m) {
+        let q = flag == F_QCASTLE;
+        subs[1] = (make_pc(ROOK, us), pos.rook_sq[castle_right(us, q)] as usize);
+        adds[1] = (make_pc(ROOK, us), if q { to + 1 } else { to - 1 });
+        ns = 2;
+        na = 2;
+    } else if flag == F_EP {
+        subs[1] = (make_pc(PAWN, us ^ 1), to ^ 8);
+        ns = 2;
+    } else if pos.board[to] != NONE_PC {
+        subs[1] = (pos.board[to], to);
+        ns = 2;
+    }
+    let mut full = [refreshes(n, 0, pos, m), refreshes(n, 1, pos, m)];
+    let ki = [kinfo(n, 0, pos.king_sq(0)), kinfo(n, 1, pos.king_sq(1))];
     // [perspective][add?][row]: only the first cnt entries are written and read.
-    let mut rows = [[[MaybeUninit::<*const i8>::uninit(); CAP]; 2]; 2];
+    let mut r8 = [[[MaybeUninit::<*const i8>::uninit(); CAP]; 2]; 2];
     let mut cnt = [[0usize; 2]; 2];
+    let mut push = |p: usize, add: bool, r: *const i8| {
+        let c = &mut cnt[p][add as usize];
+        if *c < CAP {
+            r8[p][add as usize][*c] = MaybeUninit::new(r);
+            *c += 1;
+        } else {
+            full[p] = true;
+        }
+    };
+    if n.pp && (pc_type(pc) == PAWN || (ns == 2 && !is_castle(m) && pc_type(subs[1].0) == PAWN)) {
+        let old = (pos.pcs(WHITE, PAWN), pos.pcs(BLACK, PAWN));
+        let new = (child.pcs(WHITE, PAWN), child.pcs(BLACK, PAWN));
+        for p in 0..2 {
+            crate::pawnpairs::delta(n.ppw, old, new, p, ki[p].1, |f, add| push(p, add, row8(n, f, h).as_ptr()));
+        }
+    }
+    // Unchanged king mirror for every perspective built here, so the
+    // parent's xor is the child's.
     crate::threats::delta(pos, child, |k, add| {
         for p in 0..2 {
-            if skip[p] {
-                continue;
-            }
-            if let Some(f) = crate::threats::index_of(var, k, p, xor[p]) {
-                let (a, c) = (add as usize, &mut cnt[p][add as usize]);
-                if *c < CAP {
-                    let r = thr_row(n, f, h).as_ptr();
-                    prefetch_row(r, h);
-                    rows[p][a][*c] = MaybeUninit::new(r);
-                    *c += 1;
-                } else {
-                    add_row8(acc.side_mut(p, h), thr_row(n, f, h), add);
-                }
+            if let Some(f) = crate::threats::index_of(var, k, p, ki[p].1) {
+                let r = thr_row(n, f, h).as_ptr();
+                prefetch_row(r, h);
+                push(p, add, r);
             }
         }
     });
     for p in 0..2 {
-        if cnt[p][0] + cnt[p][1] > 0 {
-            // Safe: the first cnt entries were written, and every pointer
-            // starts an h-long row of the net.
-            unsafe {
-                let init =
-                    |r: &[MaybeUninit<*const i8>]| &*(r as *const [MaybeUninit<*const i8>] as *const [*const i8]);
-                add_sub_rows8_ptr(acc.side_mut(p, h), init(&rows[p][1][..cnt[p][1]]), init(&rows[p][0][..cnt[p][0]]));
+        if full[p] {
+            refresh_cached::<H>(acc, n, p, child, cache);
+            continue;
+        }
+        let k = ki[p];
+        let a16 = [
+            row(n, feat(p, k, adds[0].0, adds[0].1), h).as_ptr(),
+            row(n, feat(p, k, adds[1].0, adds[1].1.min(63)), h).as_ptr(),
+        ];
+        let s16 = [
+            row(n, feat(p, k, subs[0].0, subs[0].1), h).as_ptr(),
+            row(n, feat(p, k, subs[1].0, subs[1].1.min(63)), h).as_ptr(),
+        ];
+        // Safe: the first cnt entries were written; every pointer starts an
+        // h-long row of the net, and both sides of the accumulators hold h.
+        unsafe {
+            let init = |r: &[MaybeUninit<*const i8>]| &*(r as *const [MaybeUninit<*const i8>] as *const [*const i8]);
+            (n.rows)(
+                acc.side_mut(p, h).as_mut_ptr(),
+                parent.side(p, h).as_ptr(),
+                h,
+                &a16[..na],
+                &s16[..ns],
+                init(&r8[p][1][..cnt[p][1]]),
+                init(&r8[p][0][..cnt[p][0]]),
+            );
+        }
+    }
+}
+
+/// dst = src + Σ a16 − Σ s16 + Σ a8 − Σ s8 over i16 and i8 rows given by
+/// pointer, in one pass: a block of the accumulator stays in registers while
+/// every row is applied, so each value is loaded and stored once per move.
+/// Chosen at load (pick_rows).
+///
+/// # Safety
+/// dst, src and every row hold h values; h is a multiple of 32.
+type RowsFn = unsafe fn(*mut i16, *const i16, usize, &[*const i16], &[*const i16], &[*const i8], &[*const i8]);
+
+fn pick_rows() -> RowsFn {
+    #[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+    if wide() {
+        return rows_x512;
+    }
+    rows_base
+}
+
+/// RowsFn with AVX2: 128 values (8 registers) per block.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+unsafe fn rows_base(
+    dst: *mut i16,
+    src: *const i16,
+    h: usize,
+    a16: &[*const i16],
+    s16: &[*const i16],
+    a8: &[*const i8],
+    s8: &[*const i8],
+) {
+    use std::arch::x86_64::*;
+    #[inline(always)]
+    unsafe fn block<const K: usize>(
+        dst: *mut i16,
+        src: *const i16,
+        o: usize,
+        a16: &[*const i16],
+        s16: &[*const i16],
+        a8: &[*const i8],
+        s8: &[*const i8],
+    ) {
+        let mut x = [_mm256_setzero_si256(); K];
+        for k in 0..K {
+            x[k] = _mm256_loadu_si256(src.add(o + 16 * k) as *const __m256i);
+        }
+        for &r in a16 {
+            for k in 0..K {
+                x[k] = _mm256_add_epi16(x[k], _mm256_loadu_si256(r.add(o + 16 * k) as *const __m256i));
             }
         }
+        for &r in s16 {
+            for k in 0..K {
+                x[k] = _mm256_sub_epi16(x[k], _mm256_loadu_si256(r.add(o + 16 * k) as *const __m256i));
+            }
+        }
+        for &r in a8 {
+            for k in 0..K {
+                x[k] =
+                    _mm256_add_epi16(x[k], _mm256_cvtepi8_epi16(_mm_loadu_si128(r.add(o + 16 * k) as *const __m128i)));
+            }
+        }
+        for &r in s8 {
+            for k in 0..K {
+                x[k] =
+                    _mm256_sub_epi16(x[k], _mm256_cvtepi8_epi16(_mm_loadu_si128(r.add(o + 16 * k) as *const __m128i)));
+            }
+        }
+        for k in 0..K {
+            _mm256_storeu_si256(dst.add(o + 16 * k) as *mut __m256i, x[k]);
+        }
+    }
+    let mut o = 0;
+    while o + 128 <= h {
+        block::<8>(dst, src, o, a16, s16, a8, s8);
+        o += 128;
+    }
+    while o < h {
+        block::<1>(dst, src, o, a16, s16, a8, s8);
+        o += 16;
+    }
+}
+
+/// RowsFn in portable Rust, 32 values per step (other targets).
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+unsafe fn rows_base(
+    dst: *mut i16,
+    src: *const i16,
+    h: usize,
+    a16: &[*const i16],
+    s16: &[*const i16],
+    a8: &[*const i8],
+    s8: &[*const i8],
+) {
+    const C: usize = 32;
+    let mut o = 0;
+    while o < h {
+        let mut x: [i16; C] = *(src.add(o) as *const [i16; C]);
+        for &r in a16 {
+            let w = &*(r.add(o) as *const [i16; C]);
+            for k in 0..C {
+                x[k] = x[k].wrapping_add(w[k]);
+            }
+        }
+        for &r in s16 {
+            let w = &*(r.add(o) as *const [i16; C]);
+            for k in 0..C {
+                x[k] = x[k].wrapping_sub(w[k]);
+            }
+        }
+        for &r in a8 {
+            let w = &*(r.add(o) as *const [i8; C]);
+            for k in 0..C {
+                x[k] = x[k].wrapping_add(w[k] as i16);
+            }
+        }
+        for &r in s8 {
+            let w = &*(r.add(o) as *const [i8; C]);
+            for k in 0..C {
+                x[k] = x[k].wrapping_sub(w[k] as i16);
+            }
+        }
+        *(dst.add(o) as *mut [i16; C]) = x;
+        o += C;
+    }
+}
+
+/// RowsFn with AVX-512: 512 values (16 registers) per block.
+#[cfg(all(target_arch = "x86_64", avx512_intrinsics))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn rows_x512(
+    dst: *mut i16,
+    src: *const i16,
+    h: usize,
+    a16: &[*const i16],
+    s16: &[*const i16],
+    a8: &[*const i8],
+    s8: &[*const i8],
+) {
+    use std::arch::x86_64::*;
+    #[target_feature(enable = "avx512f,avx512bw")]
+    #[inline]
+    unsafe fn block<const K: usize>(
+        dst: *mut i16,
+        src: *const i16,
+        o: usize,
+        a16: &[*const i16],
+        s16: &[*const i16],
+        a8: &[*const i8],
+        s8: &[*const i8],
+    ) {
+        let mut x = [_mm512_setzero_si512(); K];
+        for k in 0..K {
+            x[k] = _mm512_loadu_si512(src.add(o + 32 * k) as *const __m512i);
+        }
+        for &r in a16 {
+            for k in 0..K {
+                x[k] = _mm512_add_epi16(x[k], _mm512_loadu_si512(r.add(o + 32 * k) as *const __m512i));
+            }
+        }
+        for &r in s16 {
+            for k in 0..K {
+                x[k] = _mm512_sub_epi16(x[k], _mm512_loadu_si512(r.add(o + 32 * k) as *const __m512i));
+            }
+        }
+        for &r in a8 {
+            for k in 0..K {
+                x[k] = _mm512_add_epi16(
+                    x[k],
+                    _mm512_cvtepi8_epi16(_mm256_loadu_si256(r.add(o + 32 * k) as *const __m256i)),
+                );
+            }
+        }
+        for &r in s8 {
+            for k in 0..K {
+                x[k] = _mm512_sub_epi16(
+                    x[k],
+                    _mm512_cvtepi8_epi16(_mm256_loadu_si256(r.add(o + 32 * k) as *const __m256i)),
+                );
+            }
+        }
+        for k in 0..K {
+            _mm512_storeu_si512(dst.add(o + 32 * k) as *mut __m512i, x[k]);
+        }
+    }
+    let mut o = 0;
+    while o + 512 <= h {
+        block::<16>(dst, src, o, a16, s16, a8, s8);
+        o += 512;
+    }
+    while o < h {
+        block::<1>(dst, src, o, a16, s16, a8, s8);
+        o += 32;
     }
 }
 
 /// Starts loading an i8 row of h values into cache.
 #[inline(always)]
 fn prefetch_row(r: *const i8, h: usize) {
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (r, h);
     #[cfg(target_arch = "x86_64")]
     for o in (0..h).step_by(64) {
         // Safe: a prefetch never faults, and r + o is within the row.
         unsafe { std::arch::x86_64::_mm_prefetch(r.add(o), std::arch::x86_64::_MM_HINT_T0) };
-    }
-}
-
-/// v += Σ adds − Σ subs over i8 rows given by pointer, 32 values at a time
-/// (one pass over v for all the rows).
-///
-/// # Safety
-/// Every pointer must point at v.len() values.
-#[inline(always)]
-unsafe fn add_sub_rows8_ptr(v: &mut [i16], adds: &[*const i8], subs: &[*const i8]) {
-    const C: usize = 32;
-    let h = v.len();
-    assert!(h % C == 0);
-    let mut o = 0;
-    while o < h {
-        let mut x: [i16; C] = *(v.as_ptr().add(o) as *const [i16; C]);
-        for &a in adds {
-            let w = &*(a.add(o) as *const [i8; C]);
-            for k in 0..C {
-                x[k] = x[k].wrapping_add(w[k] as i16);
-            }
-        }
-        for &s in subs {
-            let w = &*(s.add(o) as *const [i8; C]);
-            for k in 0..C {
-                x[k] = x[k].wrapping_sub(w[k] as i16);
-            }
-        }
-        *(v.as_mut_ptr().add(o) as *mut [i16; C]) = x;
-        o += C;
     }
 }
 
