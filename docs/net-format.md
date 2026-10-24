@@ -49,7 +49,9 @@ pawn pairs in windows 0, 1, 2 (1488, 928 and 608 features, see
 (56,890, 56,218 and 54,090 features, defined in `engine/src/threats.rs`).
 Threat rows are i8 at the FT's scale QA, `[feature][hidden]`, shared by every
 king bucket, and stored after all the layers' weights (the FT's i16 block is
-unchanged). Pawn pairs are shared by every king bucket: their rows are not repeated
+unchanged), from a 64-byte file offset: zero padding (0-63 bytes) separates
+them from the last layer. Files written before this rule have no padding,
+and readers accept both. Pawn pairs are shared by every king bucket: their rows are not repeated
 per bucket but come once, after all the king buckets' rows (hidden-layer nets
 only).
 
@@ -133,7 +135,8 @@ Codes used above:
 
 ## Weights
 
-Directly after the header, with no padding between blocks:
+Directly after the header (a multiple of 64 bytes, so the FT block starts on
+a 64-byte offset), with no padding between blocks except before threat rows:
 
 1. Feature transformer weights: `[king bucket][input feature][hidden]`, then,
    with pawn pairs, `[pair feature][hidden]`.
@@ -163,7 +166,9 @@ same file or adjacent files, per colour combination, from the perspective's
 point of view: squares as for piece-square inputs (`s ^ 56` for black, then
 `^ m` with the mirror), colours as ours (0) / theirs (1). The 372 square pairs
 are numbered in order of `(a, b)`, `a < b`, over those squares; the feature is
-`pair · 4 + colour(a) · 2 + colour(b)`.
+`pair · 4 + colour(a) · 2 + colour(b)`. Their weights are stored as i16 in the
+FT block but used clamped to [-127, 127] (the engine keeps i8 rows for them);
+the converter writes them already clamped.
 
 Windows keep fewer pairs (a pawn move then changes fewer features), numbered
 the same way over the pairs they keep:

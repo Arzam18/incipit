@@ -85,18 +85,14 @@ const OUTPUT_MATERIAL: u8 = 1;
 // Path chosen by build.rs (EVALFILE, or the net named in net.txt).
 const NET_LEN: usize = include_bytes!(env!("INCIPIT_NET")).len();
 
-/// The embedded net, placed so that it ends on a 64-byte boundary: threat
-/// rows (used in place, a multiple of 64 bytes, last in the file) then start
-/// on cache lines.
+/// The embedded net on a 64-byte boundary: the FT block and the threat rows
+/// start at 64-byte file offsets, so used in place their rows start on
+/// cache lines.
 #[repr(C, align(64))]
-struct Embedded {
-    _pad: [u8; (64 - NET_LEN % 64) % 64],
-    bytes: [u8; NET_LEN],
-}
+struct Embedded([u8; NET_LEN]);
 
-static EMBEDDED: Embedded =
-    Embedded { _pad: [0; (64 - NET_LEN % 64) % 64], bytes: *include_bytes!(env!("INCIPIT_NET")) };
-static NET_BYTES: &[u8] = &EMBEDDED.bytes;
+static EMBEDDED: Embedded = Embedded(*include_bytes!(env!("INCIPIT_NET")));
+static NET_BYTES: &[u8] = &EMBEDDED.0;
 
 pub struct Network {
     h: usize,
@@ -248,6 +244,7 @@ impl Drop for AlignedI8 {
 struct Aligned {
     ptr: *mut i16,
     len: usize,
+    owned: bool,
 }
 
 impl Aligned {
@@ -257,7 +254,12 @@ impl Aligned {
         for (i, v) in values.enumerate() {
             unsafe { ptr.add(i).write(v) };
         }
-        Aligned { ptr, len }
+        Aligned { ptr, len, owned: true }
+    }
+
+    /// A view of static i16s (the embedded net), shared like AlignedI8::view.
+    fn view(values: &'static [i16]) -> Aligned {
+        Aligned { ptr: values.as_ptr() as *mut i16, len: values.len(), owned: false }
     }
 }
 
@@ -270,7 +272,9 @@ impl std::ops::Deref for Aligned {
 
 impl Drop for Aligned {
     fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr as *mut u8, weight_layout(self.len * 2)) }
+        if self.owned {
+            unsafe { std::alloc::dealloc(self.ptr as *mut u8, weight_layout(self.len * 2)) }
+        }
     }
 }
 
@@ -292,18 +296,34 @@ pub fn init() {
 fn init_net() {
     match load(NET_BYTES) {
         Ok(mut net) => {
-            // Threat rows are stored as-is at the end of the file: use them
-            // in place, shared by every process of this binary.
-            let t = net.thrw8.len();
-            if t > 0 {
-                net.thrw8 = AlignedI8::view(&NET_BYTES[NET_BYTES.len() - t..]);
-            }
+            share_weights(&mut net);
             unsafe { NET = Box::into_raw(Box::new(net)) }
         }
         Err(e) => {
             eprintln!("error: embedded network: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+/// Points the FT weights and threat rows of the embedded net at the
+/// embedded bytes where the loaded copy is identical to them (little-endian
+/// hosts; pawn-pair rows already within i8), so every process running this
+/// binary shares those pages and their cache lines: with many engines per
+/// host this matters more than any kernel. The FT block starts at the
+/// header size, the threat rows end the file.
+fn share_weights(net: &mut Network) {
+    let header = u32::from_le_bytes(NET_BYTES[12..16].try_into().unwrap()) as usize;
+    let ft = &NET_BYTES[header..header + 2 * net.ftw.len()];
+    // Safe: the header size is a multiple of 64 (converter) or at least even
+    // (checked here), and the embedded bytes are 64-byte aligned.
+    if header.is_multiple_of(2) && ft == unsafe { std::slice::from_raw_parts(net.ftw.as_ptr() as *const u8, ft.len()) }
+    {
+        net.ftw = Aligned::view(unsafe { std::slice::from_raw_parts(ft.as_ptr() as *const i16, net.ftw.len()) });
+    }
+    let t = net.thrw8.len();
+    if t > 0 {
+        net.thrw8 = AlignedI8::view(&NET_BYTES[NET_BYTES.len() - t..]);
     }
 }
 
@@ -642,12 +662,14 @@ fn load_hidden(
     }
     // The pawn-pair rows follow the king buckets' rows in the same block.
     let n_ftw = (nkb * 768 + if pp { crate::pawnpairs::features(ppw) } else { 0 }) * h;
-    // Threat rows (i8) come last, after every layer.
+    // Threat rows (i8) come last, after every layer, from a 64-byte file
+    // offset (zero padding before them; older files have none).
     let n_thr = thr.map_or(0, crate::threats::features) * h;
-    let expect = 2 * (n_ftw + h)
+    let layers = 2 * (n_ftw + h)
         + nb1 * ln * inl
-        + 4 * (nb1 * ln + buckets * n2 * (in2 + 1) + buckets * (last_in + 1) + if lin { buckets * ln } else { 0 })
-        + n_thr;
+        + 4 * (nb1 * ln + buckets * n2 * (in2 + 1) + buckets * (last_in + 1) + if lin { buckets * ln } else { 0 });
+    let padded = (header + layers).next_multiple_of(64) - header;
+    let expect = if n_thr > 0 && d.len() - header == padded + n_thr { padded + n_thr } else { layers + n_thr };
     if d.len() - header != expect {
         return Err(format!("weights are {} bytes, but the header describes {}", d.len() - header, expect));
     }
