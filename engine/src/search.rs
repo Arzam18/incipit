@@ -332,6 +332,10 @@ pub struct Searcher {
     lmr: Box<[[i32; 64]; 64]>,
     root_node_counts: Box<[[u64; 64]; 64]>,
     acc: Vec<Acc>,
+    /// Per ply, what its accumulator is made from, so the update can wait
+    /// until a position at or below that ply is evaluated: about a third of
+    /// the accumulators pushed on bench are never needed.
+    lazy: Vec<LazyAcc>,
     eval_scratch: Box<nnue::Scratch>,
     pub hash_hist: Vec<u64>,
     tb_hits: u64,
@@ -581,6 +585,7 @@ impl Searcher {
             root_node_counts: Box::new([[0; 64]; 64]),
             stats: Stats::default(),
             acc: vec![Acc::new(); MAX_PLY + 8],
+            lazy: vec![LazyAcc { pos: Position::empty(), m: 0, state: ACC_DONE }; MAX_PLY + 8],
             eval_scratch: nnue::Scratch::new(),
             root_pos: Position::empty(),
             refresh_cache: nnue::RefreshCache::new(),
@@ -797,8 +802,35 @@ impl Searcher {
         if cfg!(feature = "hce") {
             return; // bootstrap build: no NNUE, skip accumulator updates
         }
-        let (a, b) = self.acc.split_at_mut(ply + 1);
-        b[0].update_from(&a[ply], pos, child, m, &mut self.refresh_cache);
+        debug_assert!(self.lazy[ply].pos.hash == pos.hash);
+        self.lazy[ply + 1] = LazyAcc { pos: *child, m, state: ACC_UPDATE };
+    }
+
+    /// Brings the accumulator at `ply` up to date, applying the pending
+    /// updates from the nearest computed ancestor down.
+    #[inline(always)]
+    fn ensure_acc(&mut self, ply: usize) {
+        if self.lazy[ply].state != ACC_DONE {
+            self.compute_acc(ply);
+        }
+    }
+
+    #[inline(never)]
+    fn compute_acc(&mut self, ply: usize) {
+        let mut q = ply;
+        while self.lazy[q].state != ACC_DONE {
+            q -= 1;
+        }
+        for p in q + 1..=ply {
+            let (a, b) = self.acc.split_at_mut(p);
+            let l = &self.lazy[p];
+            if l.state == ACC_UPDATE {
+                b[0].update_from(&a[p - 1], &self.lazy[p - 1].pos, &l.pos, l.m, &mut self.refresh_cache);
+            } else {
+                b[0].copy_from(&a[p - 1]);
+            }
+            self.lazy[p].state = ACC_DONE;
+        }
     }
 
     /// The network's eval (side to move), without the fifty-move damping: the
@@ -808,14 +840,16 @@ impl Searcher {
         // Positions repeat within a search (transpositions, re-searches,
         // nodes that returned before storing to the TT): about 30% of
         // evaluations on bench.
-        let slot = unsafe { self.eval_cache.get_unchecked_mut(pos.hash as usize & self.eval_mask) };
-        if *slot & !0xffff == pos.hash & !0xffff && *slot != 0 {
+        let idx = pos.hash as usize & self.eval_mask;
+        let cached = unsafe { *self.eval_cache.get_unchecked(idx) };
+        if cached & !0xffff == pos.hash & !0xffff && cached != 0 {
             self.stats.eval_hits += 1;
-            return *slot as u16 as i16 as i32;
+            return cached as u16 as i16 as i32;
         }
         let e = if cfg!(feature = "hce") {
             crate::eval::evaluate(pos)
         } else {
+            self.ensure_acc(ply);
             let e = nnue::evaluate(&self.acc[ply], pos, &mut self.eval_scratch);
             // A constant (folded away) outside tune builds.
             if tp(P::EvalScale) != 100 {
@@ -825,7 +859,7 @@ impl Searcher {
             }
         };
         let e = e.clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
-        *slot = (pos.hash & !0xffff) | (e as i16 as u16 as u64);
+        unsafe { *self.eval_cache.get_unchecked_mut(idx) = (pos.hash & !0xffff) | (e as i16 as u16 as u64) };
         self.stats.evals += 1;
         e
     }
@@ -944,6 +978,7 @@ impl Searcher {
         self.pt.last_pv2 = (0, 0);
         self.seldepth = 0;
         self.acc[0].refresh(root);
+        self.lazy[0] = LazyAcc { pos: *root, m: 0, state: ACC_DONE };
         self.pt.last_info.0 = 0;
         self.root_pos = *root;
         for r in self.root_node_counts.iter_mut() {
@@ -1553,8 +1588,7 @@ impl Searcher {
                 child.make_null();
                 self.tt.prefetch(child.hash);
                 self.prefetch_eval(child.hash);
-                let (a, b) = self.acc.split_at_mut(ply + 1);
-                b[0].copy_from(&a[ply]);
+                self.lazy[ply + 1] = LazyAcc { pos: child, m: 0, state: ACC_COPY };
                 self.stack[ply].mv = 0;
                 self.stack[ply].cont_idx = 0;
                 self.hash_hist.push(pos.hash);
@@ -2469,3 +2503,16 @@ mod tests {
         }
     }
 }
+
+/// A ply's accumulator: computed, or waiting for an update from its parent's
+/// by the move that led to `pos`, or for a copy of it (null move).
+#[derive(Clone, Copy)]
+struct LazyAcc {
+    pos: Position,
+    m: Move,
+    state: u8,
+}
+
+const ACC_DONE: u8 = 0;
+const ACC_UPDATE: u8 = 1;
+const ACC_COPY: u8 = 2;
