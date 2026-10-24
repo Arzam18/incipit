@@ -13,6 +13,17 @@ mod position;
 #[allow(dead_code)]
 #[path = "../../engine/src/san.rs"]
 mod san;
+
+/// The engine's search switches read by the shared engine code above
+/// (position.rs: pin-aware SEE). Datatools uses the engine defaults.
+mod params {
+    pub enum P {
+        UsePinSee,
+    }
+    pub fn on(_: P) -> bool {
+        true
+    }
+}
 #[allow(dead_code)]
 #[path = "../../engine/src/tb.rs"]
 mod tb;
