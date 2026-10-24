@@ -160,7 +160,9 @@ same file or adjacent files, per colour combination, from the perspective's
 point of view: squares as for piece-square inputs (`s ^ 56` for black, then
 `^ m` with the mirror), colours as ours (0) / theirs (1). The 372 square pairs
 are numbered in order of `(a, b)`, `a < b`, over those squares; the feature is
-`pair · 4 + colour(a) · 2 + colour(b)`.
+`pair · 4 + colour(a) · 2 + colour(b)`. Their weights are stored as i16 in the
+FT block but used clamped to [-127, 127] (the engine keeps i8 rows for them);
+the converter writes them already clamped.
 
 Windows keep fewer pairs (a pawn move then changes fewer features), numbered
 the same way over the pairs they keep:
