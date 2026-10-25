@@ -265,11 +265,15 @@ impl Uci {
             // MoveReserve is for sudden death only (no movestogo).
             // Plus TmLagMoves moves at the measured lag: with a lag of L per
             // move, a clock below L x moves left flags however fast we move
-            // (long lichess endgames at 1+0 to 10+0 flagged this way).
+            // (long lichess endgames at 1+0 to 10+0 flagged this way). The
+            // longer the game already is, the longer it may still run, so the
+            // reserve also grows by one move per move played: a fixed 40 still
+            // flagged drawn 1+0 endgames at move ~130 (0.2 s lag per move).
+            let played = (self.hist.len() / 2) as f64;
             let reserve = self
                 .overhead
                 .saturating_mul(self.reserve_moves)
-                .max((self.lag_ms * params::tp(params::P::TmLagMoves) as f64) as i64);
+                .max((self.lag_ms * (params::tp(params::P::TmLagMoves) as f64 + played)) as i64);
             let left = if mtg == 0 && inc < self.overhead { left.saturating_sub(reserve).max(1) } else { left };
             let soft = if mtg > 0 {
                 (left / mtg.saturating_add(1).min(40)).saturating_add(inc.saturating_mul(3) / 4)
