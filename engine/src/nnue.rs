@@ -3544,6 +3544,49 @@ mod tests {
         d
     }
 
+    /// The SIMD row kernel (AVX2 or NEON) matches a plain wrapping loop:
+    /// i16 rows added and subtracted, i8 rows widened, for a hidden size with
+    /// full 128-value blocks and one with a 32-value tail.
+    #[test]
+    fn rows_base_matches_scalar() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for h in [1024usize, 160] {
+            let mk16 = |n: usize, next: &mut dyn FnMut() -> u64| -> Vec<Vec<i16>> {
+                (0..n).map(|_| (0..h).map(|_| next() as i16).collect()).collect()
+            };
+            let src: Vec<i16> = (0..h).map(|_| next() as i16).collect();
+            let (a16, s16) = (mk16(3, &mut next), mk16(2, &mut next));
+            let a8: Vec<Vec<i8>> = (0..5).map(|_| (0..h).map(|_| next() as i8).collect()).collect();
+            let s8: Vec<Vec<i8>> = (0..4).map(|_| (0..h).map(|_| next() as i8).collect()).collect();
+            let mut want = src.clone();
+            for j in 0..h {
+                for r in &a16 {
+                    want[j] = want[j].wrapping_add(r[j]);
+                }
+                for r in &s16 {
+                    want[j] = want[j].wrapping_sub(r[j]);
+                }
+                for r in &a8 {
+                    want[j] = want[j].wrapping_add(r[j] as i16);
+                }
+                for r in &s8 {
+                    want[j] = want[j].wrapping_sub(r[j] as i16);
+                }
+            }
+            let p16 = |v: &Vec<Vec<i16>>| v.iter().map(|r| r.as_ptr()).collect::<Vec<_>>();
+            let p8 = |v: &Vec<Vec<i8>>| v.iter().map(|r| r.as_ptr()).collect::<Vec<_>>();
+            let mut got = vec![0i16; h];
+            unsafe { rows_base(got.as_mut_ptr(), src.as_ptr(), h, &p16(&a16), &p16(&s16), &p8(&a8), &p8(&s8)) };
+            assert_eq!(got, want, "h {}", h);
+        }
+    }
+
     /// Incremental accumulator updates equal a full rebuild, for both sides,
     /// after every move of random games from varied positions (pawn moves,
     /// captures, en passant, promotions, castling, king moves that change
