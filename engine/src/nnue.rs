@@ -1466,8 +1466,71 @@ unsafe fn rows_base(
     }
 }
 
+/// RowsFn with NEON: 128 values (16 registers) per block, as apply_rows
+/// does for the piece rows. An i8 threat row is widened to i16 as it is
+/// loaded (eight values per half-register load).
+#[cfg(target_arch = "aarch64")]
+unsafe fn rows_base(
+    dst: *mut i16,
+    src: *const i16,
+    h: usize,
+    a16: &[*const i16],
+    s16: &[*const i16],
+    a8: &[*const i8],
+    s8: &[*const i8],
+) {
+    use std::arch::aarch64::*;
+    #[inline(always)]
+    unsafe fn block<const K: usize>(
+        dst: *mut i16,
+        src: *const i16,
+        o: usize,
+        a16: &[*const i16],
+        s16: &[*const i16],
+        a8: &[*const i8],
+        s8: &[*const i8],
+    ) {
+        let mut x = [vdupq_n_s16(0); K];
+        for k in 0..K {
+            x[k] = vld1q_s16(src.add(o + 8 * k));
+        }
+        for &r in a16 {
+            for k in 0..K {
+                x[k] = vaddq_s16(x[k], vld1q_s16(r.add(o + 8 * k)));
+            }
+        }
+        for &r in s16 {
+            for k in 0..K {
+                x[k] = vsubq_s16(x[k], vld1q_s16(r.add(o + 8 * k)));
+            }
+        }
+        for &r in a8 {
+            for k in 0..K {
+                x[k] = vaddw_s8(x[k], vld1_s8(r.add(o + 8 * k)));
+            }
+        }
+        for &r in s8 {
+            for k in 0..K {
+                x[k] = vsubw_s8(x[k], vld1_s8(r.add(o + 8 * k)));
+            }
+        }
+        for k in 0..K {
+            vst1q_s16(dst.add(o + 8 * k), x[k]);
+        }
+    }
+    let mut o = 0;
+    while o + 128 <= h {
+        block::<16>(dst, src, o, a16, s16, a8, s8);
+        o += 128;
+    }
+    while o < h {
+        block::<4>(dst, src, o, a16, s16, a8, s8);
+        o += 32;
+    }
+}
+
 /// RowsFn in portable Rust, 32 values per step (other targets).
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
 unsafe fn rows_base(
     dst: *mut i16,
     src: *const i16,
