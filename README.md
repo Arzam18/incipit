@@ -70,7 +70,7 @@ The other commands (`datagen`, `genfens`, `l1perm`, `l1stats`, `l1check`, `nnuec
 
 ## Building
 
-You need Rust (1.78 or later; 1.89 or later for the AVX-512 code and 1.98 or later for the ARM dot-product code) and a C compiler for Fathom.
+You need Rust (1.92 or later; 1.98 or later on ARM for the dot-product code) and a C compiler for Fathom.
 
 ```
 cd engine

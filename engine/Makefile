@@ -24,8 +24,9 @@ EVALFILE := $(if $(NET_URL),$(notdir $(NET_URL)),net.nnue)
 # (used by the GitHub CLI fallback when a direct download fails).
 NET_REPO := $(word 3,$(subst /, ,$(NET_URL)))/$(word 4,$(subst /, ,$(NET_URL)))
 NET_TAG := $(word 7,$(subst /, ,$(NET_URL)))
-# Cargo.lock version 4 needs cargo 1.78.
-MIN_RUST_VERSION := 1.78.0
+# The oldest Rust that builds the engine (tested with 1.92.0; 1.89 lacks
+# zeroed boxed-slice allocation). ARM dot-product code needs 1.98.
+MIN_RUST_VERSION := 1.92.0
 
 # Platform detection
 ifeq ($(OS),Windows_NT)

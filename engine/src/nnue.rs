@@ -17,15 +17,33 @@ use crate::position::*;
 /// Largest hidden size the accumulators can hold.
 pub const MAX_H: usize = 2048;
 
-/// An accumulator is the bias plus at most 32 feature rows (every piece on
-/// the board), summed in i16 with wrapping adds; reject a net where that
-/// could wrap, since both the incremental and the refresh path would do so
-/// identically and no check would notice.
-fn check_ft_range(ftw: &[i16], ftb: &[i16]) -> Result<(), String> {
-    let max = |v: &[i16]| v.iter().map(|&x| (x as i32).abs()).max().unwrap_or(0);
-    let (w, b) = (max(ftw), max(ftb));
-    if 32 * w + b > i16::MAX as i32 {
-        return Err(format!("feature transformer weights up to {} and biases up to {} can overflow i16", w, b));
+/// An accumulator is the bias plus at most 32 piece rows (every piece on
+/// the board) and, in nets with pawn pairs, at most MAX_ACTIVE pair rows
+/// (rows from `pair_start` on, clamped to i8 at load), summed in i16 with
+/// wrapping adds; reject a net where some neuron could wrap, since both the
+/// incremental and the refresh path would do so identically and no check
+/// would notice.
+fn check_ft_range(ftw: &[i16], ftb: &[i16], pair_start: usize) -> Result<(), String> {
+    let h = ftb.len();
+    let mut piece = vec![0i32; h];
+    let mut pair = vec![0i32; h];
+    for (i, &w) in ftw.iter().enumerate() {
+        let (m, w) = if i < pair_start {
+            (&mut piece[i % h], (w as i32).abs())
+        } else {
+            (&mut pair[i % h], (w as i32).abs().min(127))
+        };
+        *m = (*m).max(w);
+    }
+    let pairs = crate::pawnpairs::MAX_ACTIVE as i32;
+    for j in 0..h {
+        let worst = 32 * piece[j] + pairs * pair[j] + (ftb[j] as i32).abs();
+        if worst > i16::MAX as i32 {
+            return Err(format!(
+                "feature transformer neuron {}: piece weights up to {}, pawn-pair weights up to {} and bias {} can overflow i16",
+                j, piece[j], pair[j], ftb[j]
+            ));
+        }
     }
     Ok(())
 }
@@ -526,7 +544,7 @@ fn load_layers(d: &[u8]) -> Result<Network, String> {
     };
     let ftw = i16s(nkb * 768 * h);
     let ftb = i16s(h);
-    check_ft_range(&ftw, &ftb)?;
+    check_ft_range(&ftw, &ftb, ftw.len())?;
     let ow = i16s(buckets * 2 * h);
     // The output kernels multiply clamp(a) * w in i16 before widening.
     let max_ow = ow.iter().map(|&w| (w as i32).abs()).max().unwrap_or(0);
@@ -681,7 +699,7 @@ fn load_hidden(
     };
     let ftw = i16s(n_ftw);
     let ftb = i16s(h);
-    check_ft_range(&ftw, &ftb)?;
+    check_ft_range(&ftw, &ftb, nkb * 768 * h)?;
     // File: [bucket][out][in]. Kernels want each group of 4 inputs for all
     // outputs together: [bucket][in / 4][out][in % 4].
     let mut w1 = AlignedI8::zeroed(nb1 * ln * inl);
@@ -3585,6 +3603,23 @@ mod tests {
             unsafe { rows_base(got.as_mut_ptr(), src.as_ptr(), h, &p16(&a16), &p16(&s16), &p8(&a8), &p8(&s8)) };
             assert_eq!(got, want, "h {}", h);
         }
+    }
+
+    /// The overflow check counts every pawn pair a position can have on top
+    /// of the 32 piece rows, with pair weights as clamped to i8 at load.
+    #[test]
+    fn ft_range_counts_pawn_pairs() {
+        // Two neurons; the piece rows alone fit (32 x 1000 < 32767).
+        let (piece, bias) = ([1000i16, 0, 0, 0], [0i16, 0]);
+        assert!(check_ft_range(&piece, &bias, piece.len()).is_ok());
+        // Adding pair rows of 127 for neuron 0 can exceed i16 with 120 pairs.
+        let with_pairs = [1000i16, 0, 0, 0, 127, 0];
+        assert!(check_ft_range(&with_pairs, &bias, 4).is_err());
+        // Pair weights count as clamped: 1100 overflows as a piece weight
+        // (32 x 1100) but is 127 as a pair weight (120 x 127 fits).
+        let small = [0i16, 0, 1100, 0];
+        assert!(check_ft_range(&small, &bias, 2).is_ok());
+        assert!(check_ft_range(&small, &bias, 4).is_err());
     }
 
     /// Incremental accumulator updates equal a full rebuild, for both sides,

@@ -133,10 +133,41 @@ struct Uci {
     /// measure the next move's lag from.
     lag_prev: Option<(i64, i64, u64, usize)>,
     /// Hash of the last `position` command's base (startpos or the FEN,
-    /// before its moves): a different base without ucinewgame means an
+    /// before its moves): a different base without ucinewgame, unless the
+    /// position continues the last one (see `continues_game`), means an
     /// unrelated position (test suites, analysis), handled as a new game:
     /// TT and histories are cleared. None after ucinewgame.
     base: Option<u64>,
+}
+
+/// Whether a `position` command with a new base continues the game the
+/// engine last saw (`prev`): the same position again, a move list passing
+/// through it, or a position one or two moves on from it (a GUI that sends
+/// the current position as a FEN each turn). Anything else is a new game.
+fn continues_game(prev: &Position, pos: &Position, hist: &[u64]) -> bool {
+    if pos.hash == prev.hash || hist.contains(&prev.hash) {
+        return true;
+    }
+    let mut list = MoveList::new();
+    prev.gen_moves(&mut list, false);
+    for i in 0..list.len() {
+        let mut c = *prev;
+        if !c.make_move(list[i]) {
+            continue;
+        }
+        if c.hash == pos.hash {
+            return true;
+        }
+        let mut replies = MoveList::new();
+        c.gen_moves(&mut replies, false);
+        for k in 0..replies.len() {
+            let mut d = c;
+            if d.make_move(replies[k]) && d.hash == pos.hash {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl Uci {
@@ -163,17 +194,13 @@ impl Uci {
         } else {
             return;
         }
-        if self.base.is_some_and(|b| b != pos.hash) {
-            self.searcher.clear();
-            self.pool.each(|s| s.clear());
-        }
-        self.base = Some(pos.hash);
-        self.hist.clear();
+        let base = pos.hash;
+        let mut hist = Vec::new();
         if toks.get(i) == Some(&"moves") {
             for mstr in &toks[i + 1..] {
                 match pos.parse_move(mstr) {
                     Some(m) => {
-                        self.hist.push(pos.hash);
+                        hist.push(pos.hash);
                         pos.make_move(m);
                     }
                     None => {
@@ -185,6 +212,12 @@ impl Uci {
                 }
             }
         }
+        if self.base.is_some_and(|b| b != base) && !continues_game(&self.pos, &pos, &hist) {
+            self.searcher.clear();
+            self.pool.each(|s| s.clear());
+        }
+        self.base = Some(base);
+        self.hist = hist;
         self.pos = pos;
     }
 
@@ -267,11 +300,15 @@ impl Uci {
             // MoveReserve is for sudden death only (no movestogo).
             // Plus TmLagMoves moves at the measured lag: with a lag of L per
             // move, a clock below L x moves left flags however fast we move
-            // (long lichess endgames at 1+0 to 10+0 flagged this way).
+            // (long lichess endgames at 1+0 to 10+0 flagged this way). The
+            // longer the game already is, the longer it may still run, so the
+            // reserve also grows by one move per move played: a fixed 40 still
+            // flagged drawn 1+0 endgames at move ~130 (0.2 s lag per move).
+            let played = (self.hist.len() / 2) as f64;
             let reserve = self
                 .overhead
                 .saturating_mul(self.reserve_moves)
-                .max((self.lag_ms * params::tp(params::P::TmLagMoves) as f64) as i64);
+                .max((self.lag_ms * (params::tp(params::P::TmLagMoves) as f64 + played)) as i64);
             let left = if mtg == 0 && inc < self.overhead { left.saturating_sub(reserve).max(1) } else { left };
             let soft = if mtg > 0 {
                 (left / mtg.saturating_add(1).min(40)).saturating_add(inc.saturating_mul(3) / 4)
@@ -861,5 +898,36 @@ fn main() {
             "quit" => break,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The same game sent as a FEN of the current position (each turn, or
+    /// after the opponent's reply) is not a new game; an unrelated one is.
+    #[test]
+    fn continuation_is_not_a_new_game() {
+        attacks::init();
+        let start = Position::from_fen(START_FEN).unwrap();
+        let mut e4 = start;
+        e4.make_move(e4.parse_move("e2e4").unwrap());
+        let fen = |p: &Position| Position::from_fen(&p.to_fen()).unwrap();
+        assert!(continues_game(&e4, &fen(&e4), &[]));
+        let mut e5 = e4;
+        e5.make_move(e5.parse_move("e7e5").unwrap());
+        assert!(continues_game(&e4, &fen(&e5), &[]));
+        let mut nf3 = e5;
+        nf3.make_move(nf3.parse_move("g1f3").unwrap());
+        assert!(continues_game(&e4, &fen(&nf3), &[]));
+        // Three moves on from the last position, with no move list: new game.
+        let mut nc6 = nf3;
+        nc6.make_move(nc6.parse_move("b8c6").unwrap());
+        assert!(!continues_game(&e4, &fen(&nc6), &[]));
+        // But a move list through the last position continues it.
+        assert!(continues_game(&e4, &nc6, &[start.hash, e4.hash, e5.hash, nf3.hash]));
+        let other = Position::from_fen("kbK5/pp6/1P6/8/8/8/8/R7 w - - 0 1").unwrap();
+        assert!(!continues_game(&e4, &other, &[]));
     }
 }
