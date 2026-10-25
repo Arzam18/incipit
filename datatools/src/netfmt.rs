@@ -186,6 +186,11 @@ pub fn write_hidden(
     for v in [shift as i32, arch.qb, 0, 0] {
         lq.extend_from_slice(&v.to_le_bytes());
     }
+    // Pawn-pair rows within i8, as the engine clamps them at load: then its
+    // FT copy equals the file and it can use the file's block in place.
+    let start = arch.num_king_buckets() * 768 * h;
+    let ftw: Vec<i16> = ftw.iter().enumerate().map(|(i, &w)| if i >= start { w.clamp(-127, 127) } else { w }).collect();
+    let ftw = &ftw[..];
     let mut weights: Vec<u8> = w1.iter().map(|&v| v as u8).collect();
     let (wm, bm): (&[f32], &[f32]) = mid.unwrap_or((&[], &[]));
     for v in b1.iter().chain(wm).chain(bm).chain(w2).chain(b2).chain(lin) {
@@ -629,14 +634,15 @@ mod tests {
         let lin: Vec<f32> =
             (0..nb * l1).map(|i| if i % l1 < nlin { linf[i / l1 * nlin + i % l1] } else { 0.0 }).collect();
         assert_eq!(net, write_hidden(&a, &ftw, &ftb, &w1, &b1, Some((&wm, &bm)), &w2, &b2, &lin));
-        // A reversing permutation reverses every row, the pair rows included.
+        // A reversing permutation reverses every row, the pair rows included
+        // (written clamped to i8, as the engine uses them).
         let h = a.hidden;
         let mut rev = a.clone();
         rev.perm = (0..h / 2).rev().collect();
         let net_rev = convert(&rev, "bullet", &d).unwrap();
         let full: Vec<usize> = rev.perm.iter().copied().chain(rev.perm.iter().map(|&i| i + h / 2)).collect();
         let last_row = &ftw[ftw.len() - h..];
-        let want: Vec<i16> = full.iter().map(|&i| last_row[i]).collect();
+        let want: Vec<i16> = full.iter().map(|&i| last_row[i].clamp(-127, 127)).collect();
         let o = hdr(&net_rev) + 2 * (ftw.len() - h);
         let got: Vec<i16> = net_rev[o..o + 2 * h].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
         assert_eq!(got, want);

@@ -62,7 +62,15 @@ pub const L2_MAX: usize = 32;
 const OUTPUT_MATERIAL: u8 = 1;
 
 // Path chosen by build.rs (EVALFILE, or the net named in net.txt).
-static NET_BYTES: &[u8] = include_bytes!(env!("INCIPIT_NET"));
+const NET_LEN: usize = include_bytes!(env!("INCIPIT_NET")).len();
+
+/// The embedded net on a 64-byte boundary: the FT block starts at a 64-byte
+/// file offset, so used in place its rows start on cache lines.
+#[repr(C, align(64))]
+struct Embedded([u8; NET_LEN]);
+
+static EMBEDDED: Embedded = Embedded(*include_bytes!(env!("INCIPIT_NET")));
+static NET_BYTES: &[u8] = &EMBEDDED.0;
 
 pub struct Network {
     h: usize,
@@ -122,6 +130,41 @@ struct Hidden {
     wo: Vec<[f32; L2_MAX]>,
 }
 
+/// Layout for a weight buffer of `bytes` bytes: 64-byte aligned, or for
+/// buffers of 2 MB and more, whole 2 MB pages so they can be hugepages.
+fn weight_layout(bytes: usize) -> std::alloc::Layout {
+    const HUGE: usize = 2 << 20;
+    if bytes >= HUGE {
+        std::alloc::Layout::from_size_align(bytes.div_ceil(HUGE) * HUGE, HUGE).unwrap()
+    } else {
+        std::alloc::Layout::from_size_align(bytes.max(1), 64).unwrap()
+    }
+}
+
+/// Allocates a weight buffer (see weight_layout). Large ones are marked for
+/// transparent hugepages before first touch, so rows spread over a big
+/// table cost few TLB entries (Linux; elsewhere, and on failure, normal pages).
+fn alloc_weights(bytes: usize, zeroed: bool) -> *mut u8 {
+    let l = weight_layout(bytes);
+    let ptr = unsafe {
+        if zeroed {
+            std::alloc::alloc_zeroed(l)
+        } else {
+            std::alloc::alloc(l)
+        }
+    };
+    assert!(!ptr.is_null(), "out of memory loading the network");
+    #[cfg(target_os = "linux")]
+    if l.align() > 64 {
+        extern "C" {
+            fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        }
+        const MADV_HUGEPAGE: i32 = 14;
+        unsafe { madvise(ptr, l.size(), MADV_HUGEPAGE) };
+    }
+    ptr
+}
+
 /// A 64-byte-aligned i8 buffer.
 struct AlignedI8 {
     ptr: *mut i8,
@@ -129,13 +172,8 @@ struct AlignedI8 {
 }
 
 impl AlignedI8 {
-    fn layout(len: usize) -> std::alloc::Layout {
-        std::alloc::Layout::from_size_align(len.max(1), 64).unwrap()
-    }
     fn zeroed(len: usize) -> AlignedI8 {
-        let ptr = unsafe { std::alloc::alloc_zeroed(Self::layout(len)) } as *mut i8;
-        assert!(!ptr.is_null(), "out of memory loading the network");
-        AlignedI8 { ptr, len }
+        AlignedI8 { ptr: alloc_weights(len, true) as *mut i8, len }
     }
 }
 
@@ -154,7 +192,7 @@ impl std::ops::DerefMut for AlignedI8 {
 
 impl Drop for AlignedI8 {
     fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr as *mut u8, Self::layout(self.len)) }
+        unsafe { std::alloc::dealloc(self.ptr as *mut u8, weight_layout(self.len)) }
     }
 }
 
@@ -165,21 +203,23 @@ impl Drop for AlignedI8 {
 struct Aligned {
     ptr: *mut i16,
     len: usize,
+    owned: bool,
 }
 
 impl Aligned {
-    fn layout(len: usize) -> std::alloc::Layout {
-        std::alloc::Layout::from_size_align(len.max(1) * 2, 64).unwrap()
-    }
-
     fn from(values: impl ExactSizeIterator<Item = i16>) -> Aligned {
         let len = values.len();
-        let ptr = unsafe { std::alloc::alloc(Self::layout(len)) } as *mut i16;
-        assert!(!ptr.is_null(), "out of memory loading the network");
+        let ptr = alloc_weights(len * 2, false) as *mut i16;
         for (i, v) in values.enumerate() {
             unsafe { ptr.add(i).write(v) };
         }
-        Aligned { ptr, len }
+        Aligned { ptr, len, owned: true }
+    }
+
+    /// A view of static i16s (the embedded net): every process running the
+    /// same binary shares these pages, so concurrent engines share caches.
+    fn view(values: &'static [i16]) -> Aligned {
+        Aligned { ptr: values.as_ptr() as *mut i16, len: values.len(), owned: false }
     }
 }
 
@@ -192,7 +232,9 @@ impl std::ops::Deref for Aligned {
 
 impl Drop for Aligned {
     fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr as *mut u8, Self::layout(self.len)) }
+        if self.owned {
+            unsafe { std::alloc::dealloc(self.ptr as *mut u8, weight_layout(self.len * 2)) }
+        }
     }
 }
 
@@ -213,11 +255,30 @@ pub fn init() {
 
 fn init_net() {
     match load(NET_BYTES) {
-        Ok(net) => unsafe { NET = Box::into_raw(Box::new(net)) },
+        Ok(mut net) => {
+            share_weights(&mut net);
+            unsafe { NET = Box::into_raw(Box::new(net)) }
+        }
         Err(e) => {
             eprintln!("error: embedded network: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+/// Points the FT weights of the embedded net at the embedded bytes where the
+/// loaded copy is identical to them (little-endian hosts; pawn-pair rows
+/// already within i8), so every process running this binary shares those
+/// pages and their cache lines: with many engines per host this matters
+/// more than any kernel. The FT block starts at the header size.
+fn share_weights(net: &mut Network) {
+    let header = u32::from_le_bytes(NET_BYTES[12..16].try_into().unwrap()) as usize;
+    let ft = &NET_BYTES[header..header + 2 * net.ftw.len()];
+    // Safe: the header size is a multiple of 64 (converter) or at least even
+    // (checked here), and the embedded bytes are 64-byte aligned.
+    if header.is_multiple_of(2) && ft == unsafe { std::slice::from_raw_parts(net.ftw.as_ptr() as *const u8, ft.len()) }
+    {
+        net.ftw = Aligned::view(unsafe { std::slice::from_raw_parts(ft.as_ptr() as *const i16, net.ftw.len()) });
     }
 }
 
