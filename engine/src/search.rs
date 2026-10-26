@@ -2299,6 +2299,7 @@ impl Searcher {
     fn qsearch(&mut self, pos: &Position, mut alpha: i32, beta: i32, ply: usize) -> i32 {
         self.nodes += 1;
         self.stats.qs_nodes += 1;
+        self.pv_len[ply] = 0;
         if self.nodes & 1023 == 0 {
             self.check_time();
         }
@@ -2419,6 +2420,16 @@ impl Searcher {
                 if score > alpha {
                     alpha = score;
                     best_move = m;
+                    // Extend the PV through qsearch, so a mate or capture line
+                    // found here is reported in full.
+                    if pv_node {
+                        self.pv[ply][0] = m;
+                        let cl = self.pv_len[ply + 1];
+                        for k in 0..cl {
+                            self.pv[ply][k + 1] = self.pv[ply + 1][k];
+                        }
+                        self.pv_len[ply] = cl + 1;
+                    }
                     if alpha >= beta {
                         break;
                     }
