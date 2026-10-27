@@ -54,6 +54,8 @@ usage:
   datatools bin <out_dir> <in.bin> ...        old datagen .bin -> viriformat, one
                                               <out_dir>/<name>.vf per input, in parallel
   datatools stats <file.vf> ...               count games and positions
+  datatools heldout <every> <in.vf> ...       every Nth training-eligible position (quiet, not in check, ply >= 16,
+                                              scored) as FEN, game result for the side to move, score (TSV)
   datatools plystats <in.vf> ...              positions per ply and how many are distinct (by hash),
                                               to see where the ply filter removes duplicates
   datatools structstats <in.vf> ...           king safety and pawn-structure rates by game phase (ply bands),
@@ -112,6 +114,7 @@ fn main() {
         Some("pgn") if args.len() >= 4 => cmd_pgn(&args[2], &args[3..]),
         Some("bin") if args.len() >= 4 => cmd_bin(&args[2], &args[3..]),
         Some("stats") if args.len() >= 3 => cmd_stats(&args[2..]),
+        Some("heldout") if args.len() >= 4 => cmd_heldout(&args[2], &args[3..]),
         Some("plystats") if args.len() >= 3 => cmd_plystats(&args[2..]),
         Some("structstats") if args.len() >= 3 => cmd_structstats(&args[2..]),
         Some("tbstats") if args.len() >= 4 => cmd_tbstats(&args[2], &args[3..]),
@@ -554,6 +557,35 @@ fn cmd_bishopstats(out: &str, inputs: &[String]) -> Result<(), String> {
 /// Positions per ply (from the FEN's move number, as the trainer's ply filter
 /// counts it) and how many are distinct by Zobrist hash, cumulatively below
 /// each ply too: how many duplicates each ply cut would remove.
+/// Held-out evaluation positions: every Nth position the trainer would use
+/// (scored, not in check, ply >= 16, quiet move), as FEN, the game result from
+/// the side to move's view (1, 0.5, 0) and its stored score (side to move), tab-separated.
+fn cmd_heldout(every: &str, inputs: &[String]) -> Result<(), String> {
+    let every: u64 = every.parse().map_err(|_| format!("bad count {}", every))?;
+    let mut n = 0u64;
+    let out = std::io::stdout();
+    let mut out = std::io::BufWriter::new(out.lock());
+    for input in inputs {
+        let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
+        viri::for_each_position(&data, |pos, m, score, wdl| {
+            let ply = 2 * (pos.fullmove as i32 - 1) + (pos.stm != position::WHITE) as i32;
+            if score == viri::NO_SCORE || pos.checkers != 0 || ply < 16 || position::is_noisy(m) {
+                return;
+            }
+            n += 1;
+            if n % every != 0 {
+                return;
+            }
+            // viri WDL codes are white-relative: 0 black win, 1 draw, 2 white win.
+            let white = pos.stm == position::WHITE;
+            let r = if white { wdl } else { 2 - wdl };
+            let s = if white { score as i32 } else { -(score as i32) };
+            let _ = writeln!(out, "{}\t{}\t{}", pos.to_fen(), r as f32 / 2.0, s);
+        })?;
+    }
+    Ok(())
+}
+
 fn cmd_plystats(inputs: &[String]) -> Result<(), String> {
     const MAX: usize = 64;
     let mut count = [0u64; MAX + 1];
