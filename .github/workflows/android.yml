@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   android-arm64:
-    name: Build Android ARM64
+    name: Incipit Android ARM64
     runs-on: ubuntu-latest
 
     steps:
@@ -24,73 +24,59 @@ jobs:
         with:
           fetch-depth: 50
 
-      - name: Install Rust
+      - name: Install Rust target
         run: |
-          rustup toolchain install stable
-          rustup default stable
           rustup target add aarch64-linux-android
-          rustc --version
-          cargo --version
 
-      - name: Set up Android NDK
-        uses: android-actions/setup-android@v3
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
-      - name: Configure Android linker
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "ndk;27.3.13750724"
+
+      - name: Configure Android compiler
         shell: bash
         run: |
           set -euo pipefail
 
-          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
-
-          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
-            echo "Android NDK path not found."
-            env | grep -E 'ANDROID.*NDK' || true
-            exit 1
-          fi
-
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          NDK="$SDK/ndk/27.3.13750724"
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          if [ ! -x "$TOOLCHAIN/aarch64-linux-android24-clang" ]; then
-            echo "Android ARM64 NDK compiler not found:"
-            ls -la "$TOOLCHAIN" | head -50
-            exit 1
-          fi
+          test -x "$TOOLCHAIN/aarch64-linux-android24-clang"
 
-          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "CC_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
 
-      - name: Download and verify NNUE network
+          echo "Android NDK: $NDK"
+          "$TOOLCHAIN/aarch64-linux-android24-clang" --version
+
+      - name: Download NNUE network
         working-directory: engine
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y make curl
           make net
           test -s "$(basename "$(cat net.txt)")"
-          echo "NNUE network ready."
 
-      - name: Build Android ARM64 binary
+      - name: Compile Incipit for Android
         working-directory: engine
-        env:
-          CARGO_TERM_COLOR: always
         run: |
           set -euo pipefail
 
-          NET="$(pwd)/$(basename "$(cat net.txt)")"
+          NET="$PWD/$(basename "$(cat net.txt)")"
 
-          export CC_aarch64_linux_android
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
-          export EVALFILE="$NET"
-
-          # Baseline ARM64; do not assume optional CPU instructions.
-          export RUSTFLAGS="-C target-cpu=generic"
-
-          cargo build \
-            --release \
-            --target aarch64-linux-android
+          CC_aarch64_linux_android="$CC_aarch64_linux_android" \
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER" \
+          EVALFILE="$NET" \
+          RUSTFLAGS="-C target-cpu=generic" \
+            cargo build --release --target aarch64-linux-android
 
           mkdir -p ../dist
           cp target/aarch64-linux-android/release/incipit \
@@ -99,7 +85,7 @@ jobs:
           file ../dist/incipit-android-arm64
           ls -lh ../dist/incipit-android-arm64
 
-      - name: Upload Android development binary
+      - name: Upload Android binary
         uses: actions/upload-artifact@v4
         with:
           name: incipit-android-arm64
