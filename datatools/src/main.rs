@@ -70,6 +70,7 @@ usage:
                                               score under the set's WDL model (wdlfit's a and b), so
                                               sigmoid(score / 400) is the label's calibrated
                                               probability; unscored positions unchanged
+                                              (writes <out_dir>/CALIBRATED, which incipit-train-v2 requires)
   datatools bishopstats <out.csv> <in.vf> ... one bishop a side: opposite- vs same-coloured, score and result
                                               by pawn lead (side to move), to check how nets score OCB endings
   datatools matstats <out.csv> <in.vf> ...    stored score and result by material lead, side to move,
@@ -352,6 +353,10 @@ fn cmd_calibrate(a: &str, b: &str, out_dir: &str, inputs: &[String]) -> Result<(
     if let Some(e) = errors.first() {
         return Err(format!("{} files failed, first: {}", errors.len(), e));
     }
+    // Marker the trainer checks before training on a directory: these scores
+    // are calibrated (cal2), and with which WDL model.
+    let marker = std::path::Path::new(out_dir).join("CALIBRATED");
+    std::fs::write(&marker, format!("cal2\na {}\nb {}\n", a, b)).map_err(|e| format!("{}: {}", marker.display(), e))?;
     println!("calibrated {} files into {}", inputs.len(), out_dir);
     Ok(())
 }
