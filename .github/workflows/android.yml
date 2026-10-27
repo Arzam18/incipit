@@ -1,108 +1,33 @@
 
-name: Android Development Build
-
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "engine/**"
-      - "third_party/fathom/**"
-      - ".github/workflows/android.yml"
-
-permissions:
-  contents: read
-
-jobs:
-  android-arm64:
-    name: Incipit Android ARM64
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 50
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-          rustup target add aarch64-linux-android
-          rustc --version
-          cargo --version
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Set up Android NDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: "ndk;27.3.13750724"
-
-      - name: Configure Android toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          NDK="$SDK/ndk/27.3.13750724"
-          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-          test -x "$BIN/aarch64-linux-android24-clang"
-          test -x "$BIN/llvm-ar"
-
-          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
-          echo "ANDROID_CC=$BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
-          echo "ANDROID_AR=$BIN/llvm-ar" >> "$GITHUB_ENV"
-
-          "$BIN/aarch64-linux-android24-clang" --version
-          "$BIN/llvm-ar" --version
-
-      - name: Download NNUE network
-        working-directory: engine
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y make curl
-          make net
-
-          test -s net.txt
-          NET_NAME="$(basename "$(cat net.txt)")"
-          test -s "$NET_NAME"
-
-          echo "NNUE network found: $NET_NAME"
-          ls -lh "$NET_NAME"
-
       - name: Build Incipit for Android ARM64
         working-directory: engine
         shell: bash
         run: |
           set -euo pipefail
 
-          # Resolve the NNUE network to an absolute path.
           NET="$PWD/$(basename "$(cat net.txt)")"
           test -s "$NET"
 
-          # Remove previous objects, including any host-built Fathom archive.
           cargo clean
 
-          # IMPORTANT:
-          # engine/build.rs reads CC and AR directly.
-          # Target-specific Cargo linker variables alone are insufficient.
           export CC="$ANDROID_CC"
           export AR="$ANDROID_AR"
           export EVALFILE="$NET"
+
+          # Configure Cargo's Android target linker explicitly.
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<EOF
+          [target.aarch64-linux-android]
+          linker = "$ANDROID_CC"
+          EOF
+
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_CC"
           export RUSTFLAGS="-C target-cpu=generic"
 
-          echo "C compiler: $CC"
-          echo "Archiver:   $AR"
-          echo "Target:     aarch64-linux-android"
-          echo "Network:    $EVALFILE"
+          echo "Android compiler: $CC"
+          echo "Android archiver: $AR"
+          echo "Android linker: $CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+          echo "NNUE network: $EVALFILE"
 
           cargo build \
             --release \
@@ -117,11 +42,3 @@ jobs:
 
           file ../dist/incipit-android-arm64
           ls -lh ../dist/incipit-android-arm64
-
-      - name: Upload Android development binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: incipit-android-arm64
-          path: dist/incipit-android-arm64
-          if-no-files-found: error
-          retention-days: 30
