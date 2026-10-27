@@ -54,6 +54,10 @@ usage:
   datatools bin <out_dir> <in.bin> ...        old datagen .bin -> viriformat, one
                                               <out_dir>/<name>.vf per input, in parallel
   datatools stats <file.vf> ...               count games and positions
+  datatools plystats <in.vf> ...              positions per ply and how many are distinct (by hash),
+                                              to see where the ply filter removes duplicates
+  datatools structstats <in.vf> ...           king safety and pawn-structure rates by game phase (ply bands),
+                                              to compare our self-play with normal games
   datatools tbstats <tb_dir> <in.vf> ...      games reaching the Syzygy tables: game result vs tablebase result
   datatools wdlstats <out.csv> <in.vf> ...    win/draw/loss counts by (material, eval), side to move,
                                               for fitting a WDL model (from ply 16, not in check, scored)
@@ -107,6 +111,8 @@ fn main() {
         Some("pgn") if args.len() >= 4 => cmd_pgn(&args[2], &args[3..]),
         Some("bin") if args.len() >= 4 => cmd_bin(&args[2], &args[3..]),
         Some("stats") if args.len() >= 3 => cmd_stats(&args[2..]),
+        Some("plystats") if args.len() >= 3 => cmd_plystats(&args[2..]),
+        Some("structstats") if args.len() >= 3 => cmd_structstats(&args[2..]),
         Some("tbstats") if args.len() >= 4 => cmd_tbstats(&args[2], &args[3..]),
         Some("wdlstats") if args.len() >= 4 => cmd_wdlstats(&args[2], &args[3..]),
         Some("piecestats") if args.len() >= 3 => cmd_piecestats(&args[2..]),
@@ -537,6 +543,126 @@ fn cmd_bishopstats(out: &str, inputs: &[String]) -> Result<(), String> {
     }
     std::fs::write(out, w).map_err(|e| format!("{}: {}", out, e))?;
     println!("{} positions counted -> {}", used, out);
+    Ok(())
+}
+
+/// Positions per ply (from the FEN's move number, as the trainer's ply filter
+/// counts it) and how many are distinct by Zobrist hash, cumulatively below
+/// each ply too: how many duplicates each ply cut would remove.
+fn cmd_plystats(inputs: &[String]) -> Result<(), String> {
+    const MAX: usize = 64;
+    let mut count = [0u64; MAX + 1];
+    let mut seen: Vec<std::collections::HashSet<u64>> = vec![std::collections::HashSet::new(); MAX + 1];
+    let mut all = std::collections::HashSet::new();
+    let mut total = 0u64;
+    for input in inputs {
+        let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
+        viri::for_each_position(&data, |pos, _, _, _| {
+            let ply = (2 * (pos.fullmove as usize).max(1) - 2 + (pos.stm != position::WHITE) as usize).min(MAX);
+            count[ply] += 1;
+            seen[ply].insert(pos.hash);
+            all.insert(pos.hash);
+            total += 1;
+        })?;
+    }
+    println!(
+        "{} positions, {} distinct ({:.1}% duplicates overall)",
+        total,
+        all.len(),
+        100.0 * (1.0 - all.len() as f64 / total as f64)
+    );
+    println!("ply\tpositions\tdistinct\tdup%\tcum_positions%");
+    let mut cum = 0u64;
+    for p in 0..=MAX {
+        if count[p] == 0 {
+            continue;
+        }
+        cum += count[p];
+        let d = seen[p].len() as u64;
+        println!(
+            "{}{}\t{}\t{}\t{:.1}\t{:.1}",
+            p,
+            if p == MAX { "+" } else { "" },
+            count[p],
+            d,
+            100.0 * (1.0 - d as f64 / count[p] as f64),
+            100.0 * cum as f64 / total as f64
+        );
+    }
+    Ok(())
+}
+
+/// Per side and ply band: how often the king has castled (and keeps a pawn
+/// shield), stays on its home square, and how the pawns are spread, as rates
+/// per position and side. Standard-chess sets only: the squares assume the
+/// normal start (DFRC kings start elsewhere).
+fn cmd_structstats(inputs: &[String]) -> Result<(), String> {
+    const BANDS: [(usize, usize); 5] = [(0, 15), (16, 27), (28, 47), (48, 79), (80, 9999)];
+    const NAMES: [&str; 9] = [
+        "king_g/h",
+        "king_a/b/c",
+        "king_g/h+shield",
+        "king_home",
+        "pawns",
+        "doubled",
+        "isolated",
+        "centre_pawn",
+        "castle_rights",
+    ];
+    let mut sums = [[0f64; NAMES.len()]; BANDS.len()];
+    let mut n = [0u64; BANDS.len()];
+    let files: Vec<u64> = (0..8).map(|f| 0x0101_0101_0101_0101u64 << f).collect();
+    for input in inputs {
+        let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
+        viri::for_each_position(&data, |pos, _, _, _| {
+            let ply = 2 * (pos.fullmove as usize).max(1) - 2 + (pos.stm != position::WHITE) as usize;
+            let Some(b) = BANDS.iter().position(|&(lo, hi)| (lo..=hi).contains(&ply)) else { return };
+            n[b] += 2;
+            for c in 0..2 {
+                // Square in this side's frame (black flipped to look like white).
+                let rel = |sq: u32| if c == 0 { sq } else { sq ^ 56 };
+                let king = rel((pos.pieces[5] & pos.colors[c]).trailing_zeros());
+                let pawns = pos.pieces[0] & pos.colors[c];
+                let own = |sq: u32| pawns >> rel(sq) & 1 != 0;
+                let v = &mut sums[b];
+                let kingside = king == 6 || king == 7;
+                v[0] += kingside as u8 as f64;
+                v[1] += (king <= 2) as u8 as f64;
+                let shield = [13, 14, 15, 21, 22, 23].iter().filter(|&&q| own(q)).count();
+                v[2] += (kingside && shield >= 2) as u8 as f64;
+                v[3] += (king == 4) as u8 as f64;
+                v[4] += pawns.count_ones() as f64;
+                for f in 0..8 {
+                    let k = (pawns & files[f]).count_ones();
+                    if k > 1 {
+                        v[5] += (k - 1) as f64;
+                    }
+                    let side = (if f > 0 { files[f - 1] } else { 0 }) | (if f < 7 { files[f + 1] } else { 0 });
+                    if k > 0 && pawns & side == 0 {
+                        v[6] += k as f64;
+                    }
+                }
+                v[7] += [27, 28, 35, 36].iter().filter(|&&q| own(q)).count() as f64;
+                let rights = if c == 0 { pos.castling & 3 } else { pos.castling >> 2 & 3 };
+                v[8] += (rights != 0) as u8 as f64;
+            }
+        })?;
+    }
+    print!("band\tsides");
+    for name in NAMES {
+        print!("\t{}", name);
+    }
+    println!();
+    for (b, &(lo, hi)) in BANDS.iter().enumerate() {
+        if n[b] == 0 {
+            continue;
+        }
+        print!("{}-{}\t{}", lo, if hi > 999 { "".to_string() } else { hi.to_string() }, n[b]);
+        for v in sums[b] {
+            print!("\t{:.3}", v / n[b] as f64);
+        }
+        println!();
+    }
     Ok(())
 }
 
