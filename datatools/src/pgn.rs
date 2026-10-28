@@ -84,17 +84,26 @@ fn parse_tag(t: &str) -> Option<(String, String)> {
     Some((inner[..sp].to_string(), val.replace("\\\"", "\"")))
 }
 
+/// Label written for a tablebase win/loss score (cp, mover's view; 0 = off),
+/// set by `datatools pgn --tb-label CP`.
+pub static TB_LABEL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// Parses the score at the start of a fastchess comment: Some(cp) from the
 /// mover's point of view, or None for a mate score, a tablebase score or no
-/// parseable score. Mates and tablebase results aren't trained on as evals,
-/// so they don't need a value.
+/// parseable score. Mates aren't trained on as evals. Tablebase scores (from
+/// datagen with engine probing) become +-TB_LABEL when that is set, so a
+/// proven tablebase result trains as a decisive label instead of being dropped.
 pub fn parse_score(comment: &str) -> Option<i16> {
     let s = comment.trim().split('/').next()?.trim();
     let pawns: f64 = s.parse().ok()?;
     let cp = (pawns * 100.0).round();
     // The engine reports tablebase wins/losses as cp +-(20000 - plies), plies
     // < 256; no search eval comes near that.
-    (cp.abs() < TB_SCORE_MIN).then(|| cp as i16)
+    if cp.abs() < TB_SCORE_MIN {
+        return Some(cp as i16);
+    }
+    let label = TB_LABEL.load(std::sync::atomic::Ordering::Relaxed);
+    (label != 0).then(|| (label * cp.signum() as i32) as i16)
 }
 
 /// Smallest |cp| treated as a tablebase score.

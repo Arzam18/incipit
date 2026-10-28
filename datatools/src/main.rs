@@ -49,7 +49,9 @@ use std::sync::Mutex;
 
 const USAGE: &str = "\
 usage:
-  datatools pgn <out.vf> <in.pgn | -> ...     OpenBench/fastchess PGNs -> viriformat
+  datatools pgn <out.vf> [--tb-label CP] <in.pgn | -> ...
+                                              OpenBench/fastchess PGNs -> viriformat (--tb-label: tablebase
+                                              win/loss scores become +-CP labels instead of unscored)
                                               (- reads stdin, e.g. bzcat *.pgn.bz2 | ...)
   datatools bin <out_dir> <in.bin> ...        old datagen .bin -> viriformat, one
                                               <out_dir>/<name>.vf per input, in parallel
@@ -147,7 +149,22 @@ fn open_input(path: &str) -> Result<Box<dyn std::io::BufRead>, String> {
     }
 }
 
-fn cmd_pgn(out: &str, inputs: &[String]) -> Result<(), String> {
+fn cmd_pgn(out: &str, args: &[String]) -> Result<(), String> {
+    // --tb-label CP: tablebase scores become +-CP labels (else unscored).
+    let mut inputs: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--tb-label" {
+            let cp: i32 = it.next().and_then(|v| v.parse().ok()).ok_or("--tb-label needs a cp value")?;
+            if !(1..19000).contains(&cp) {
+                return Err(format!("--tb-label {} out of range 1..19000", cp));
+            }
+            pgn::TB_LABEL.store(cp, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            inputs.push(a.clone());
+        }
+    }
+    let inputs = &inputs;
     let mut w = BufWriter::new(File::create(out).map_err(|e| format!("{}: {}", out, e))?);
     let (mut games, mut moves, mut skipped) = (0u64, 0u64, 0u64);
     for input in inputs {
