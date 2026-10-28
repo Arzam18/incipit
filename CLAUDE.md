@@ -55,3 +55,6 @@ The models doing this work were trained on public material that almost certainly
 
 ## 9. Log every experiment and model
 Every network training run goes in `models.md`, and every other experiment (search or eval change, SPSA tune, tooling or pipeline test) in `experiments.md`, both in the private `incipit-research` repo. Add one entry per run at the bottom, following the template at the top of each file, including failures and inconclusive results; don't rewrite old entries. A training run goes in `models.md` only, not both.
+
+## 10. Workflows
+Standing procedures (testing, training, data, GPU hosts, code, operations, priorities) live in the private `incipit-research` repo under `docs/workflows/` (start at its `README.md`). Read the relevant doc before acting. Don't keep workflow rules in private agent memory, since several sessions work on Incipit: when a procedure or an owner rule changes, update those docs and commit.
