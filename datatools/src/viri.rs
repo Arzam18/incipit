@@ -187,6 +187,66 @@ pub fn map_scores(data: &[u8], mut f: impl FnMut(&Position, i16) -> i16) -> Resu
     Ok(out)
 }
 
+/// Rewrites each game's result and scores with `f(positions and stored
+/// scores, result, new scores)`: `f` gets the replayed positions with their
+/// white-relative scores and may change the result (viri WDL code) and any
+/// score. Boards and moves are kept, so the output has the same games and
+/// positions in the same order.
+pub fn rewrite_games(
+    data: &[u8],
+    mut f: impl FnMut(&[(Position, i16)], &mut u8, &mut [i16]),
+) -> Result<Vec<u8>, String> {
+    let mut out = data.to_vec();
+    let mut i = 0;
+    let mut game: Vec<(Position, i16)> = Vec::new();
+    let mut offs: Vec<usize> = Vec::new();
+    let mut scores: Vec<i16> = Vec::new();
+    while i < out.len() {
+        if i + 32 > out.len() {
+            return Err(format!("truncated board at byte {}", i));
+        }
+        let board = i;
+        let (mut pos, _, mut wdl) = unpack_board(&out[i..i + 32]).ok_or_else(|| format!("bad board at byte {}", i))?;
+        i += 32;
+        game.clear();
+        offs.clear();
+        loop {
+            if i + 4 > out.len() {
+                return Err(format!("unterminated game at byte {}", i));
+            }
+            let raw = u16::from_le_bytes([out[i], out[i + 1]]);
+            let score = i16::from_le_bytes([out[i + 2], out[i + 3]]);
+            if raw == 0 && score == 0 {
+                i += 4;
+                break;
+            }
+            let mut list = MoveList::new();
+            pos.gen_moves(&mut list, false);
+            let m = (0..list.len())
+                .map(|k| list[k])
+                .find(|&m| {
+                    encode_move(&pos, m) == raw && {
+                        let mut c = pos;
+                        c.make_move(m)
+                    }
+                })
+                .ok_or_else(|| format!("illegal move {:04x} in {}", raw, pos.to_fen()))?;
+            game.push((pos, score));
+            offs.push(i + 2);
+            pos.make_move(m);
+            i += 4;
+        }
+        scores.clear();
+        scores.extend(game.iter().map(|g| g.1));
+        f(&game, &mut wdl, &mut scores);
+        out[board + 30] = wdl;
+        for (&o, &sc) in offs.iter().zip(&scores) {
+            out[o..o + 2].copy_from_slice(&sc.to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
 /// Rebuilds a Position from a packed board (the inverse of pack_board).
 /// Returns None if the board isn't valid.
 pub fn unpack_board(b: &[u8]) -> Option<(Position, i16, u8)> {
