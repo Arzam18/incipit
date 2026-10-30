@@ -405,3 +405,42 @@ fn map_scores_sees_positions() {
     viri::for_each_position(&out, |_, _, s, _| got.push(s)).unwrap();
     assert_eq!(got, vec![1, 999, viri::NO_SCORE, 1000]);
 }
+
+#[test]
+fn rewrite_games_changes_only_result_and_scores() {
+    crate::attacks::init();
+    let start = Position::from_fen(START_FEN).unwrap();
+    let mut pos = start;
+    let mut moves = Vec::new();
+    for (k, s) in [100i16, -37, viri::NO_SCORE, 0].into_iter().enumerate() {
+        let m = legal(&pos)[k];
+        moves.push((m, s));
+        pos.make_move(m);
+    }
+    let game = Game { start, wdl: viri::WDL_DRAW, moves };
+    let mut bytes = Vec::new();
+    game.write(&mut bytes).unwrap();
+    bytes.extend(bytes.clone());
+    // A no-op rewrite is byte-identical.
+    assert_eq!(viri::rewrite_games(&bytes, |_, _, _| {}).unwrap(), bytes);
+    // The callback sees each game's positions and scores; its result and
+    // score changes are written back, everything else is kept.
+    let mut seen = Vec::new();
+    let out = viri::rewrite_games(&bytes, |g, wdl, sc| {
+        seen.push(g.iter().map(|(p, s)| (p.stm, *s)).collect::<Vec<_>>());
+        *wdl = viri::WDL_WHITE_WIN;
+        sc[1] = 555;
+    })
+    .unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], vec![(0, 100), (1, -37), (0, viri::NO_SCORE), (1, 0)]);
+    let mut got = Vec::new();
+    viri::for_each_position(&out, |_, m, s, w| got.push((m, s, w))).unwrap();
+    let want: Vec<_> = [100i16, 555, viri::NO_SCORE, 0]
+        .iter()
+        .zip(&game.moves)
+        .map(|(&s, &(m, _))| (m, s, viri::WDL_WHITE_WIN))
+        .collect();
+    assert_eq!(&got[..4], &want[..]);
+    assert_eq!(&got[4..], &want[..]);
+}

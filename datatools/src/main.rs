@@ -63,6 +63,11 @@ usage:
   datatools structstats <in.vf> ...           king safety and pawn-structure rates by game phase (ply bands),
                                               to compare our self-play with normal games
   datatools tbstats <tb_dir> <in.vf> ...      games reaching the Syzygy tables: game result vs tablebase result
+  datatools tbrelabel <tb_dir> <out_dir> [--fix-result] [--score CP] <in.vf> ...
+                                              relabel with the Syzygy tables: --fix-result sets each game's
+                                              result to the table result at its first table position with a
+                                              fresh fifty-move clock (as tbstats); --score CP sets the score of
+                                              every scored table position to +-CP (win/loss, side to move) or 0
   datatools wdlstats <out.csv> <in.vf> ...    win/draw/loss counts by (material, eval), side to move,
                                               for fitting a WDL model (from ply 16, not in check, scored)
   datatools wdlfit <stats.csv>                 fit the WDL model to wdlstats output (maximum likelihood)
@@ -120,6 +125,7 @@ fn main() {
         Some("plystats") if args.len() >= 3 => cmd_plystats(&args[2..]),
         Some("structstats") if args.len() >= 3 => cmd_structstats(&args[2..]),
         Some("tbstats") if args.len() >= 4 => cmd_tbstats(&args[2], &args[3..]),
+        Some("tbrelabel") if args.len() >= 5 => cmd_tbrelabel(&args[2], &args[3], &args[4..]),
         Some("wdlstats") if args.len() >= 4 => cmd_wdlstats(&args[2], &args[3..]),
         Some("piecestats") if args.len() >= 3 => cmd_piecestats(&args[2..]),
         Some("threatstats") if args.len() >= 4 => cmd_threatstats(&args[2], &args[3..]),
@@ -926,6 +932,90 @@ fn cmd_tbstats(tb_path: &str, inputs: &[String]) -> Result<(), String> {
     for g in 0..3 {
         println!("  {:>9}: black win {:>8}  draw {:>8}  white win {:>8}", name[g], m[g][0], m[g][1], m[g][2]);
     }
+    Ok(())
+}
+
+fn cmd_tbrelabel(tb_path: &str, out_dir: &str, args: &[String]) -> Result<(), String> {
+    let largest = tb::init(tb_path);
+    if largest == 0 {
+        return Err(format!("no tablebases found in {}", tb_path));
+    }
+    let (mut fix_result, mut score_cp, mut inputs) = (false, None, Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--fix-result" => fix_result = true,
+            "--score" => {
+                let cp: i16 = it.next().and_then(|v| v.parse().ok()).ok_or("--score needs a cp value")?;
+                if !(1..=19000).contains(&cp) {
+                    return Err(format!("--score {} out of range 1..19000", cp));
+                }
+                score_cp = Some(cp);
+            }
+            _ => inputs.push(a.clone()),
+        }
+    }
+    if !fix_result && score_cp.is_none() {
+        return Err("tbrelabel needs --fix-result and/or --score CP".into());
+    }
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {}", out_dir, e))?;
+    let in_tb = |p: &position::Position| p.occ().count_ones() <= largest && p.castling == 0;
+    // White-relative viri WDL code of a table result for the side to move.
+    let white_wdl = |r: tb::Wdl, stm_white: bool| match (r, stm_white) {
+        (tb::Wdl::Draw, _) => viri::WDL_DRAW,
+        (tb::Wdl::Win, true) | (tb::Wdl::Loss, false) => viri::WDL_WHITE_WIN,
+        _ => viri::WDL_BLACK_WIN,
+    };
+    let (mut games, mut changed, mut relabelled, mut failed) = (0u64, 0u64, 0u64, 0u64);
+    for input in &inputs {
+        let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
+        let out = viri::rewrite_games(&data, |game, wdl, scores| {
+            games += 1;
+            if fix_result {
+                if let Some((p, _)) = game.iter().find(|(p, _)| in_tb(p) && p.halfmove == 0) {
+                    match tb::probe_wdl(p) {
+                        Some(r) => {
+                            let t = white_wdl(r, p.stm == position::WHITE);
+                            if t != *wdl {
+                                *wdl = t;
+                                changed += 1;
+                            }
+                        }
+                        None => failed += 1,
+                    }
+                }
+            }
+            if let Some(cp) = score_cp {
+                for (k, (p, s)) in game.iter().enumerate() {
+                    if *s == viri::NO_SCORE || !in_tb(p) {
+                        continue;
+                    }
+                    // The WDL tables answer for a fresh fifty-move count; with a
+                    // running clock this can call a cursed win a win (rare).
+                    let mut q = *p;
+                    q.halfmove = 0;
+                    let Some(r) = tb::probe_wdl(&q) else {
+                        failed += 1;
+                        continue;
+                    };
+                    scores[k] = match white_wdl(r, p.stm == position::WHITE) {
+                        viri::WDL_WHITE_WIN => cp,
+                        viri::WDL_BLACK_WIN => -cp,
+                        _ => 0,
+                    };
+                    relabelled += 1;
+                }
+            }
+        })
+        .map_err(|e| format!("{}: {}", input, e))?;
+        let name = std::path::Path::new(input).file_name().ok_or("bad input name")?;
+        let path = std::path::Path::new(out_dir).join(name);
+        std::fs::write(&path, out).map_err(|e| format!("{}: {}", path.display(), e))?;
+    }
+    println!(
+        "{}-man tables; {} games, results changed {}, scores relabelled {}, probe failures {}",
+        largest, games, changed, relabelled, failed
+    );
     Ok(())
 }
 
