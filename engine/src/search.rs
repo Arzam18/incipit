@@ -366,8 +366,18 @@ pub struct Searcher {
     /// Root moves skipped by the root search: the moves of the earlier MultiPV
     /// lines while a later line is searched (empty otherwise).
     root_excluded: Vec<Move>,
+    /// Gain history: the average change in static eval, from the mover's
+    /// side, that a quiet move by this piece to this square brings
+    /// ([piece][to], cp). Learned at every node a quiet move leads to, not
+    /// only at cutoffs, from the evals the search computes anyway.
+    gain: Vec<[i32; 64]>,
+    /// The quiet move that led to each ply, for `gain_learn`: (piece, to,
+    /// the parent's static eval).
+    gain_par: Vec<Option<(u8, u8, i32)>>,
     /// Each MultiPV line's score at the last completed depth (aspiration centres).
     line_scores: Vec<i32>,
+    /// MultiPV lines of the last completed depth, best first: (score, first move).
+    pub lines: Vec<(i32, Move)>,
 }
 
 /// One completed iteration: depth, best move, score, nodes and time so far.
@@ -589,7 +599,10 @@ impl Searcher {
             iter_log: None,
             multi_pv: 1,
             root_excluded: Vec::new(),
+            gain: vec![[0; 64]; 12],
+            gain_par: vec![None; MAX_PLY + 16],
             line_scores: Vec::new(),
+            lines: Vec::new(),
             no_nmp_ply: usize::MAX,
             search_moves: Vec::new(),
             lmr,
@@ -665,6 +678,7 @@ impl Searcher {
         Arc::get_mut(&mut self.tt).expect("TT cleared during a search").clear();
         self.eval_cache.fill(0);
         *self.hist = [[[[0; 64]; 64]; 4]; 2];
+        self.gain.iter_mut().for_each(|g| *g = [0; 64]);
         Arc::get_mut(&mut self.sh).expect("histories cleared during a search").clear();
         *self.capt = [[[0; 7]; 64]; 12];
         self.killers = Align64([[0; 2]; MAX_PLY + 4]);
@@ -1014,6 +1028,7 @@ impl Searcher {
         }
         self.root_excluded.clear();
         self.line_scores.clear();
+        self.lines.clear();
         if fallback == 0 {
             if !self.silent {
                 println!("info depth 0 score {} nodes 0 time 0", if root.checkers != 0 { "mate 0" } else { "cp 0" });
@@ -1204,6 +1219,7 @@ impl Searcher {
                     (best, score) = (top[0], lines[0].0);
                 }
                 self.line_scores = lines.iter().map(|l| l.0).collect();
+                self.lines = lines.iter().map(|l| (l.0, l.1[0])).collect();
             }
             if !self.silent {
                 if lines.is_empty() {
@@ -1529,6 +1545,9 @@ impl Searcher {
         let mut eval;
         let mut raw_eval = -INF;
         if in_check {
+            self.gain_par[ply] = None;
+        }
+        if in_check {
             static_eval = -INF;
             eval = -INF;
         } else if excluded != 0 {
@@ -1537,6 +1556,9 @@ impl Searcher {
         } else {
             raw_eval = if let Some(e) = tte { e.eval as i32 } else { self.evaluate(pos, ply) };
             static_eval = self.corrected(pos, raw_eval, prev1, prev2);
+            if on(P::UseGainHist) {
+                self.gain_learn(ply, static_eval);
+            }
             eval = static_eval;
             // The stored score replaces the eval only where the TT cutoff
             // would trust it (the fifty-move guard), so it can't drive pruning
@@ -1609,6 +1631,7 @@ impl Searcher {
                 self.lazy[ply + 1] = LazyAcc { pos: child, m: 0, state: ACC_COPY };
                 self.stack[ply].mv = 0;
                 self.stack[ply].cont_idx = 0;
+                self.gain_par[ply + 1] = None;
                 self.hash_hist.push(pos.hash);
                 let v = -self.negamax(&child, -beta, -beta + 1, depth - r, ply + 1, !cut_node);
                 self.hash_hist.pop();
@@ -1670,6 +1693,7 @@ impl Searcher {
                     let pc = pos.board[mfrom(m)] as usize;
                     self.stack[ply].mv = m;
                     self.stack[ply].cont_idx = pc * 64 + mto(m);
+                    self.gain_par[ply + 1] = None;
                     self.hash_hist.push(pos.hash);
                     let mut v = -self.qsearch(&child, -pc_beta, -pc_beta + 1, ply + 1);
                     if v >= pc_beta {
@@ -1862,11 +1886,12 @@ impl Searcher {
                 continue;
             }
             // TT/killer priority is an ordering bonus, not a history value.
-            // Other quiets already carry their history in the ordering score.
+            // Other quiets already carry their history in the ordering score,
+            // with the gain history's share, which is for ordering only.
             let hist_score = if !quiet {
                 0
             } else if mscore < (1 << 27) {
-                mscore
+                mscore - self.gain_order(pos, m)
             } else {
                 self.quiet_history(pos, m, [prev1, prev2, prev4, prev6], threats)
             };
@@ -1980,6 +2005,8 @@ impl Searcher {
             let pc = pos.board[mfrom(m)] as usize;
             self.stack[ply].mv = m;
             self.stack[ply].cont_idx = pc * 64 + mto(m);
+            self.gain_par[ply + 1] =
+                if quiet && static_eval != -INF { Some((pc as u8, mto(m) as u8, static_eval)) } else { None };
             self.hash_hist.push(pos.hash);
             let nodes_before = self.nodes;
             let new_depth = depth - 1 + ext;
@@ -2248,6 +2275,30 @@ impl Searcher {
         n
     }
 
+    /// Learns the gain of the quiet move that led to this ply from the
+    /// node's static eval (both corrected, mover's view): an average over
+    /// about the last 16 such nodes, the change clamped to +-600 cp.
+    #[inline]
+    fn gain_learn(&mut self, ply: usize, eval: i32) {
+        if let Some((pc, to, pe)) = self.gain_par[ply].take() {
+            if eval.abs() < MATE_BOUND && pe.abs() < MATE_BOUND {
+                let g = (-eval - pe).clamp(-600, 600);
+                let a = &mut self.gain[pc as usize][to as usize];
+                *a += (g - *a) / 16;
+            }
+        }
+    }
+
+    /// The gain history's share of a quiet's ordering score.
+    #[inline(always)]
+    fn gain_order(&self, pos: &Position, m: Move) -> i32 {
+        if on(P::UseGainHist) {
+            self.gain[pos.board[mfrom(m)] as usize][mto(m)] * tp(P::GainOrdMul)
+        } else {
+            0
+        }
+    }
+
     #[inline(always)]
     fn quiet_history(&self, pos: &Position, m: Move, prev: [usize; 4], threats: u64) -> i32 {
         let pc = pos.board[mfrom(m)] as usize;
@@ -2319,6 +2370,7 @@ impl Searcher {
             } else {
                 self.quiet_history(pos, m, [prev1, prev2, prev4, prev6], threats)
                     + if check_sq[pc_type(pos.board[mfrom(m)])] >> mto(m) & 1 != 0 { tp(P::CheckBonus) } else { 0 }
+                    + self.gain_order(pos, m)
             };
             scores.push(score);
         }
@@ -2381,6 +2433,9 @@ impl Searcher {
             let prev1 = if ply >= 1 { self.stack[ply - 1].cont_idx } else { 0 };
             let prev2 = if ply >= 2 { self.stack[ply - 2].cont_idx } else { 0 };
             best = self.corrected(pos, raw_eval, prev1, prev2);
+            if on(P::UseGainHist) {
+                self.gain_learn(ply, best);
+            }
             if let Some(e) = tte {
                 let s = e.score as i32;
                 if s.abs() < MATE_BOUND
@@ -2442,6 +2497,7 @@ impl Searcher {
             self.prefetch_eval(child.hash);
             legal += 1;
             self.push_acc(ply, pos, &child, m);
+            self.gain_par[ply + 1] = None;
             // For the child's continuation correction.
             self.stack[ply].cont_idx = pos.board[mfrom(m)] as usize * 64 + mto(m);
             let score = -self.qsearch(&child, -beta, -alpha, ply + 1);
