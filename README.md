@@ -48,7 +48,7 @@ The x86-64 builds need AVX2 and BMI2 (Intel Haswell or AMD Zen 1 and later). Fas
 
 | Option | Default | |
 |---|---|---|
-| `Hash` | 16 | Transposition table size in MB (1-65536). |
+| `Hash` | 64 | Transposition table size in MB (1-65536). |
 | `Threads` | 1 | Search threads (1-256). |
 | `MoveOverhead` | 20 | Milliseconds reserved per move for communication lag (0-5000). `Move Overhead` is accepted too. |
 | `Ponder` | false | Allow pondering. |
@@ -58,7 +58,6 @@ The x86-64 builds need AVX2 and BMI2 (Intel Haswell or AMD Zen 1 and later). Fas
 | `UCI_ShowWDL` | false | Add win/draw/loss estimates (per mille) to `info` lines. |
 | `NormalizeScore` | true | Report scores on the 100 = 50% winning-chance scale; false gives the network's raw scale. |
 | `SyzygyPath` | (empty) | Directories of Syzygy tablebase files, separated by `:` (`;` on Windows). |
-| `EvalCacheKB` | 256 | Size of the per-thread evaluation cache in KB. |
 | `MoveReserve` | 0 | In sudden-death games, keep time back for this many further moves (useful for online play with network lag). |
 | `TmLog` | false | Developer option: print a time-management summary after each search. |
 

@@ -9,19 +9,9 @@ use std::time::Instant;
 
 pub const INF: i32 = 32000;
 
-/// Entries in an eval cache of `kb` kilobytes (8 bytes each, a power of two).
-fn eval_cache_entries(kb: usize) -> usize {
-    let n = (kb.max(1) << 10) / 8;
-    1 << (usize::BITS - 1 - n.leading_zeros())
-}
 pub const MATE: i32 = 31000;
 pub const MATE_BOUND: i32 = MATE - 512;
 pub const MAX_PLY: usize = 128;
-/// Default eval cache size in KB (UCI EvalCacheKB). Sized for the per-core
-/// L2: under concurrent load (16 engines on sn1) 2 MB tables evict the FT
-/// weights from the shared L3 and cost ~9% nps, while 256 KB is neutral for
-/// the plain net and +5% for the hidden net.
-pub const EVAL_CACHE_KB: usize = 256;
 /// Tablebase wins score TB_WIN - ply: above every eval (evals stay below
 /// MATE_BOUND) and below every mate (MATE - ply >= MATE - MAX_PLY), so code
 /// that treats |score| >= MATE_BOUND as decisive handles them like mates.
@@ -52,6 +42,11 @@ struct Frame {
     cont_idx: usize, // piece*64+to of the move made at this ply
     excluded: Move,
     mv: Move,
+    // A static eval the parent computed for this ply's node (child-eval LMR):
+    // the node's hash, its raw and corrected eval.
+    pre_key: u64,
+    pre_raw: i32,
+    pre_se: i32,
 }
 
 /// Search statistics, cumulative until reset (bench sums them over its
@@ -314,10 +309,6 @@ pub struct Searcher {
     no_nmp_ply: usize,
     root_depth: i32,
     seldepth: usize,
-    /// Raw static evals by position: hash bits 16..64 check the entry, bits
-    /// 0..16 hold the eval (i16). Direct-mapped, indexed by the low hash bits.
-    eval_cache: Box<[u64]>,
-    eval_mask: usize,
     /// Shared with helper threads while they search; only the owner holds
     /// it between searches (see `clear`).
     pub tt: Arc<TT>,
@@ -564,8 +555,6 @@ impl Searcher {
         let lmr = Box::new([[0i32; 64]; 64]);
         let mut s = Searcher {
             tt: Arc::new(TT::new(hash_mb)),
-            eval_cache: vec![0u64; eval_cache_entries(EVAL_CACHE_KB)].into_boxed_slice(),
-            eval_mask: eval_cache_entries(EVAL_CACHE_KB) - 1,
             nodes: 0,
             stop_flag,
             pt: Box::new(PonderTm {
@@ -632,52 +621,12 @@ impl Searcher {
         }
     }
 
-    /// Starts loading the eval-cache slot for `hash` (the table is too large
-    /// for the CPU caches at bigger sizes).
-    #[inline(always)]
-    fn prefetch_eval(&self, hash: u64) {
-        let p = unsafe { self.eval_cache.as_ptr().add(hash as usize & self.eval_mask) } as *const i8;
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0)
-        };
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly))
-        };
-    }
-
-    /// Resizes (and clears) the eval cache to the largest power-of-two
-    /// number of entries that fits in `kb` kilobytes.
-    /// The old cache is freed first, so the peak is the new size, not both;
-    /// if the memory isn't there it falls back to smaller sizes (Err with
-    /// the size it got) instead of aborting.
-    pub fn set_eval_cache_kb(&mut self, kb: usize) -> Result<(), usize> {
-        self.eval_cache = vec![0u64; 1].into_boxed_slice();
-        self.eval_mask = 0;
-        let mut n = eval_cache_entries(kb);
-        loop {
-            let mut v: Vec<u64> = Vec::new();
-            if v.try_reserve_exact(n).is_ok() {
-                v.resize(n, 0);
-                self.eval_cache = v.into_boxed_slice();
-                self.eval_mask = n - 1;
-                return if n == eval_cache_entries(kb) { Ok(()) } else { Err(n * 8 / 1024) };
-            }
-            if n == 1 {
-                return Err(0);
-            }
-            n /= 2;
-        }
-    }
-
     pub fn clear(&mut self) {
         self.pt.spend_avg = 1.0;
         self.pt.ponder_seen = false;
         // Helpers drop their handles when a search ends, so between searches
         // this is the only one.
         Arc::get_mut(&mut self.tt).expect("TT cleared during a search").clear();
-        self.eval_cache.fill(0);
         *self.hist = [[[[0; 64]; 64]; 4]; 2];
         self.gain.iter_mut().for_each(|g| *g = [0; 64]);
         Arc::get_mut(&mut self.sh).expect("histories cleared during a search").clear();
@@ -826,6 +775,27 @@ impl Searcher {
         }
     }
 
+    /// The child's corrected static eval from the mover's view, None in check.
+    /// The raw eval is the child's TT eval if it has an entry, else the
+    /// network's (the child's accumulator must be pushed). Both are kept for
+    /// the child's node, which then doesn't compute them again.
+    fn child_eval(&mut self, pos: &Position, child: &Position, m: Move, ply: usize, prev1: usize) -> Option<i32> {
+        if child.checkers != 0 {
+            return None;
+        }
+        let raw = match self.tt.probe(child.hash) {
+            Some(e) if (e.eval as i32).abs() < MATE_BOUND => e.eval as i32,
+            _ => self.evaluate(child, ply + 1),
+        };
+        let ci = pos.board[mfrom(m)] as usize * 64 + mto(m);
+        let se = self.corrected(child, raw, ci, prev1);
+        let f = &mut self.stack[ply + 1];
+        f.pre_key = child.hash;
+        f.pre_raw = raw;
+        f.pre_se = se;
+        Some(-se)
+    }
+
     #[inline(always)]
     fn push_acc(&mut self, ply: usize, pos: &Position, child: &Position, m: Move) {
         if cfg!(feature = "hce") {
@@ -869,11 +839,12 @@ impl Searcher {
         // Positions repeat within a search (transpositions, re-searches,
         // nodes that returned before storing to the TT): about 30% of
         // evaluations on bench.
-        let idx = pos.hash as usize & self.eval_mask;
-        let cached = unsafe { *self.eval_cache.get_unchecked(idx) };
-        if cached & !0xffff == pos.hash & !0xffff && cached != 0 {
+        // The eval lives in the main TT: search entries carry it, and
+        // `store_eval` adds eval-only entries for positions evaluated but not
+        // stored. Replacing a separate eval cache with this gained +9.9 (#4995).
+        if let Some(e) = self.tt.probe_eval(pos.hash) {
             self.stats.eval_hits += 1;
-            return cached as u16 as i16 as i32;
+            return e as i32;
         }
         let e = if cfg!(feature = "hce") {
             crate::eval::evaluate(pos)
@@ -888,7 +859,7 @@ impl Searcher {
             }
         };
         let e = e.clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
-        unsafe { *self.eval_cache.get_unchecked_mut(idx) = (pos.hash & !0xffff) | (e as i16 as u16 as u64) };
+        self.tt.store_eval(pos.hash, e);
         self.stats.evals += 1;
         e
     }
@@ -963,13 +934,23 @@ impl Searcher {
         (2..=lim).step_by(2).any(|k| self.hash_hist.get(n + 1 - k) == Some(&c.hash))
     }
 
-    fn is_repetition(&self, pos: &Position) -> bool {
+    /// Whether `pos` (at `ply`) is scored a draw by repetition. The last `ply`
+    /// entries of `hash_hist` are the search path (root first), the rest the
+    /// game before the root. Repeating a position of the search path is a draw
+    /// (the side that repeated can repeat again); a position that only
+    /// occurred before the root needs a second earlier occurrence (threefold),
+    /// or a twofold the opponent need not continue would score 0.
+    fn is_repetition(&self, pos: &Position, ply: usize) -> bool {
         let n = self.hash_hist.len();
         let lim = (pos.halfmove as usize).min(n);
+        let mut before_root = false;
         let mut k = 4;
         while k <= lim {
             if self.hash_hist[n - k] == pos.hash {
-                return true;
+                if k <= ply || before_root {
+                    return true;
+                }
+                before_root = true;
             }
             k += 2;
         }
@@ -1423,7 +1404,7 @@ impl Searcher {
         if depth <= 0 {
             // qsearch doesn't check repetitions, so a move into a repeated
             // position at the last ply would otherwise not be scored a draw.
-            if !root && self.is_repetition(pos) {
+            if !root && self.is_repetition(pos, ply) {
                 return 0;
             }
             return self.qsearch(pos, alpha, beta, ply);
@@ -1440,7 +1421,7 @@ impl Searcher {
         }
         let in_check = pos.checkers != 0;
         if !root {
-            if self.is_repetition(pos) || pos.insufficient_material() {
+            if self.is_repetition(pos, ply) || pos.insufficient_material() {
                 return 0;
             }
             // Fifty-move rule, unless the side to move is checkmated.
@@ -1555,8 +1536,14 @@ impl Searcher {
             static_eval = self.stack[ply].static_eval;
             eval = static_eval;
         } else {
-            raw_eval = if let Some(e) = tte { e.eval as i32 } else { self.evaluate(pos, ply) };
-            static_eval = self.corrected(pos, raw_eval, prev1, prev2);
+            if self.stack[ply].pre_key == pos.hash {
+                self.stack[ply].pre_key = 0;
+                raw_eval = self.stack[ply].pre_raw;
+                static_eval = self.stack[ply].pre_se;
+            } else {
+                raw_eval = if let Some(e) = tte { e.eval as i32 } else { self.evaluate(pos, ply) };
+                static_eval = self.corrected(pos, raw_eval, prev1, prev2);
+            }
             if on(P::UseGainHist) {
                 self.gain_learn(ply, static_eval);
             }
@@ -1628,7 +1615,6 @@ impl Searcher {
                 let mut child = *pos;
                 child.make_null();
                 self.tt.prefetch(child.hash);
-                self.prefetch_eval(child.hash);
                 self.lazy[ply + 1] = LazyAcc { pos: child, m: 0, state: ACC_COPY };
                 self.stack[ply].mv = 0;
                 self.stack[ply].cont_idx = 0;
@@ -1689,7 +1675,6 @@ impl Searcher {
                         continue;
                     }
                     self.tt.prefetch(child.hash);
-                    self.prefetch_eval(child.hash);
                     self.push_acc(ply, pos, &child, m);
                     let pc = pos.board[mfrom(m)] as usize;
                     self.stack[ply].mv = m;
@@ -1710,7 +1695,7 @@ impl Searcher {
                                 ply + 1,
                                 !cut_node,
                             );
-                        } else if self.is_repetition(&child) {
+                        } else if self.is_repetition(&child, ply + 1) {
                             v = 0;
                         }
                     }
@@ -1964,7 +1949,6 @@ impl Searcher {
                 continue;
             }
             self.tt.prefetch(child.hash);
-            self.prefetch_eval(child.hash);
             legal += 1;
 
             // extensions
@@ -2055,6 +2039,17 @@ impl Searcher {
                     // A node that was on the PV before deserves a closer look.
                     if on(P::UseTtPv) && tt_pv && !pv_node {
                         r -= 1;
+                    }
+                    // The child's static eval: near or above alpha the move may
+                    // well beat it, far below it rarely does.
+                    if on(P::UseCevLmr) && r > 0 {
+                        if let Some(ce) = self.child_eval(pos, &child, m, ply, prev1) {
+                            if ce >= alpha - tp(P::CevLmrMargin) {
+                                r -= 1;
+                            } else if ce < alpha - tp(P::CevLmrMore) {
+                                r += 1;
+                            }
+                        }
                     }
                     if quiet {
                         r -= hist_score / tp(P::LmrHistDiv);
@@ -2437,10 +2432,16 @@ impl Searcher {
         if in_check {
             best = -INF;
         } else {
-            raw_eval = if let Some(e) = tte { e.eval as i32 } else { self.evaluate(pos, ply) };
-            let prev1 = if ply >= 1 { self.stack[ply - 1].cont_idx } else { 0 };
-            let prev2 = if ply >= 2 { self.stack[ply - 2].cont_idx } else { 0 };
-            best = self.corrected(pos, raw_eval, prev1, prev2);
+            if self.stack[ply].pre_key == pos.hash {
+                self.stack[ply].pre_key = 0;
+                raw_eval = self.stack[ply].pre_raw;
+                best = self.stack[ply].pre_se;
+            } else {
+                raw_eval = if let Some(e) = tte { e.eval as i32 } else { self.evaluate(pos, ply) };
+                let prev1 = if ply >= 1 { self.stack[ply - 1].cont_idx } else { 0 };
+                let prev2 = if ply >= 2 { self.stack[ply - 2].cont_idx } else { 0 };
+                best = self.corrected(pos, raw_eval, prev1, prev2);
+            }
             if on(P::UseGainHist) {
                 self.gain_learn(ply, best);
             }
@@ -2485,7 +2486,7 @@ impl Searcher {
             pick(list.as_mut_slice(), scores.as_mut_slice(), i, n);
             let m = list[i];
             if !in_check {
-                if on(P::UseQsSee) && !pos.see_ge(m, 0, &see_vals()) {
+                if on(P::UseQsSee) && !pos.see_ge(m, -tp(P::QsSeeMargin), &see_vals()) {
                     continue;
                 }
             } else if on(P::UseQsEvasionLimit)
@@ -2502,7 +2503,6 @@ impl Searcher {
                 continue;
             }
             self.tt.prefetch(child.hash);
-            self.prefetch_eval(child.hash);
             legal += 1;
             self.push_acc(ply, pos, &child, m);
             self.gain_par[ply + 1] = None;
