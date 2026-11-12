@@ -372,6 +372,9 @@ pub struct Searcher {
     line_scores: Vec<i32>,
     /// MultiPV lines of the last completed depth, best first: (score, first move).
     pub lines: Vec<(i32, Move)>,
+    /// Root in the tablebases and drawn: the root moves that keep the
+    /// result, the only ones searched (empty: no restriction).
+    root_tb: Vec<Move>,
 }
 
 /// One completed iteration: depth, best move, score, nodes and time so far.
@@ -596,6 +599,7 @@ impl Searcher {
             gain_par: vec![None; MAX_PLY + 16],
             line_scores: Vec::new(),
             lines: Vec::new(),
+            root_tb: Vec::new(),
             no_nmp_ply: usize::MAX,
             search_moves: Vec::new(),
             mate_moves: None,
@@ -703,7 +707,9 @@ impl Searcher {
         cands[0].pv[..len].copy_from_slice(&self.pv[0][..len]);
         for slot in self.helper_slots.iter() {
             let r = *crate::smp::lock(&slot.result);
-            if r.depth >= d - 1 && r.len > 0 {
+            // Helpers search every root move: one that gives a tablebase
+            // result away doesn't vote.
+            if r.depth >= d - 1 && r.len > 0 && (self.root_tb.is_empty() || self.root_tb.contains(&r.pv[0])) {
                 cands.push(r);
             }
         }
@@ -1021,38 +1027,46 @@ impl Searcher {
             }
             return (0, 0);
         }
-        // Root in the tablebases: play the move that keeps the result, with the
-        // fifty-move counter taken into account (DTZ).
+        // Root in the tablebases. A win or a loss: play the move that keeps
+        // the result, with the fifty-move counter taken into account (DTZ),
+        // without searching. A draw, or a table move that would repeat a
+        // game position (which the tables don't know about): search as
+        // usual, but only the moves that keep the result (a cursed win's
+        // moves that keep that). So a drawn root still looks for the move
+        // that asks the most of the opponent, and no search here can pick a
+        // move that gives the result away: the search itself only probes
+        // after captures and pawn moves.
         // Fathom's root probe isn't thread-safe: the main thread alone does
-        // it. In a tablebase position it returns at once and the helpers,
-        // which search on, are stopped with it.
+        // it. After a win or loss it returns at once and the helpers, which
+        // search on, are stopped with it.
+        self.root_tb.clear();
         if crate::tb::largest() > 0 && self.search_moves.is_empty() && self.thread_id == 0 {
-            if let Some((w, m)) = crate::tb::probe_root(root).filter(|&(_, m)| !self.repeats_after(root, m)) {
-                let s = match w {
-                    crate::tb::Wdl::Win => TB_WIN - 1,
-                    crate::tb::Wdl::Loss => -TB_WIN + 1,
-                    crate::tb::Wdl::Draw => 0,
-                };
-                if !self.silent {
-                    // A tablebase result is certain: report it as such, not
-                    // through the eval-based WDL model (a draw is 0 1000 0).
-                    let wdl = if SHOW_WDL.load(Ordering::Relaxed) {
-                        match w {
-                            crate::tb::Wdl::Win => " wdl 1000 0 0",
-                            crate::tb::Wdl::Loss => " wdl 0 0 1000",
-                            crate::tb::Wdl::Draw => " wdl 0 1000 0",
-                        }
-                    } else {
-                        ""
-                    };
-                    println!(
-                        "info depth 1 score {}{} nodes 0 tbhits 1 time 0 pv {}",
-                        score_str(s, root),
-                        wdl,
-                        root.move_uci(m)
-                    );
+            if let Some(t) = crate::tb::probe_root_moves(root) {
+                let (w, m) = (t.wdl, t.best);
+                if w != crate::tb::Wdl::Draw && !self.repeats_after(root, m) {
+                    let s = if w == crate::tb::Wdl::Win { TB_WIN - 1 } else { -TB_WIN + 1 };
+                    if !self.silent {
+                        // A tablebase result is certain: report it as such, not
+                        // through the eval-based WDL model.
+                        let wdl = match (SHOW_WDL.load(Ordering::Relaxed), w) {
+                            (false, _) => "",
+                            (_, crate::tb::Wdl::Win) => " wdl 1000 0 0",
+                            _ => " wdl 0 0 1000",
+                        };
+                        println!(
+                            "info depth 1 score {}{} nodes 0 tbhits 1 time 0 pv {}",
+                            score_str(s, root),
+                            wdl,
+                            root.move_uci(m)
+                        );
+                    }
+                    return (m, s);
                 }
-                return (m, s);
+                if t.keep.len() < root_moves {
+                    self.root_tb = t.keep;
+                    fallback = self.root_tb[0];
+                    root_moves = self.root_tb.len();
+                }
             }
         }
         let mut best = fallback;
@@ -1675,7 +1689,24 @@ impl Searcher {
             {
                 let mut list = MoveList::new();
                 pos.gen_moves(&mut list, true);
-                for i in 0..list.len() {
+                // Tried in the order most likely to cut: the TT move, then by
+                // the value captured (as the main loop orders captures), so
+                // fewer confirmation searches run before the cut.
+                let mut scores = Stack256::<i32>::new();
+                for &m in list.as_slice() {
+                    let ct = pos.captured_type(m);
+                    let pc = pos.board[mfrom(m)] as usize;
+                    scores.push(if m == tt_move {
+                        1 << 30
+                    } else {
+                        see_vals()[ct.min(5)] * 16 * (ct < 6) as i32
+                            + if is_promo(m) && promo_pt(m) == QUEEN { 8000 } else { 0 }
+                            + self.capt[pc][mto(m)][ct] as i32 / tp(P::CapOrdDiv)
+                    });
+                }
+                let n = list.len();
+                for i in 0..n {
+                    pick(list.as_mut_slice(), scores.as_mut_slice(), i, n);
                     let m = list[i];
                     if !pos.see_ge(m, pc_beta - static_eval, &see_vals()) {
                         continue;
@@ -1873,6 +1904,7 @@ impl Searcher {
             if m == excluded
                 || (root
                     && ((!self.search_moves.is_empty() && !self.search_moves.contains(&m))
+                        || (!self.root_tb.is_empty() && !self.root_tb.contains(&m))
                         || self.root_excluded.contains(&m)))
             {
                 continue;
@@ -2673,6 +2705,33 @@ mod tests {
         let mut fresh = Searcher::new(16, Arc::new(AtomicBool::new(false)));
         fresh.silent = true;
         assert_eq!(used.search(&pos, &lim), fresh.search(&pos, &lim));
+    }
+
+    /// A drawn tablebase root is searched over the draw-keeping moves only.
+    /// In this KRvKB position Kd1 loses, and an unrestricted search played
+    /// it in a game. Needs the 5-man tables in /tablebases, and loads them
+    /// (process-wide state other tests' searches would see), so run it
+    /// alone: `cargo test --release drawn_tb_root -- --ignored`.
+    #[test]
+    #[ignore]
+    fn drawn_tb_root_keeps_the_draw() {
+        crate::attacks::init();
+        crate::nnue::init();
+        if !std::path::Path::new("/tablebases/KRvKB.rtbz").exists() || crate::tb::init("/tablebases") < 4 {
+            return;
+        }
+        let pos = Position::from_fen("8/8/3b4/8/8/3K4/4R3/2k5 b - - 71 44").unwrap();
+        let t = crate::tb::probe_root_moves(&pos).unwrap();
+        assert_eq!(t.wdl, crate::tb::Wdl::Draw);
+        let losing = pos.parse_move("c1d1").unwrap();
+        assert!(!t.keep.contains(&losing));
+        let mut s = Searcher::new(8, Arc::new(AtomicBool::new(false)));
+        s.silent = true;
+        for d in 1..=8 {
+            let (m, _) = s.search(&pos, &Limits { soft_ms: None, hard_ms: None, depth: d, nodes: None });
+            assert!(t.keep.contains(&m), "depth {d} played {}", pos.move_uci(m));
+        }
+        crate::tb::init("");
     }
 
     /// Printed scores: 100 at the WDL model's 50%-win score, scaled in
