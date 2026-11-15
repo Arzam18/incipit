@@ -58,6 +58,9 @@ usage:
   datatools stats <file.vf> ...               count games and positions
   datatools heldout <every> <in.vf> ...       every Nth training-eligible position (quiet, not in check, ply >= 16,
                                               scored) as FEN, game result for the side to move, score (TSV)
+  datatools gamedump <every> <in.vf> ...      every Nth trainer position with its game context (TSV): game, ply,
+                                              plies left to the game's end, pieces, material lead (textbook pawns,
+                                              side to move), stored score and result (side to move)
   datatools plystats <in.vf> ...              positions per ply and how many are distinct (by hash),
                                               to see where the ply filter removes duplicates
   datatools structstats <in.vf> ...           king safety and pawn-structure rates by game phase (ply bands),
@@ -67,26 +70,39 @@ usage:
                                               won table positions (side to move wins, DTZ >= min_dtz plies)
                                               for conversion tests: up to per_class each of KRvK, KQvK, KBNvK,
                                               KQvKR, as EPD on stdout
-  datatools tbrelabel <tb_dir> <out_dir> [--fix-result] [--score CP | --score-dtz LO HI PER_PAWN | --score-keep CP] <in.vf> ...
+  datatools tbrelabel <tb_dir> <out_dir> [--fix-result] [--label-unscored] [--score CP | --score-dtz LO HI PER_PAWN | --score-keep CP | --score-grade LO PER D CAP] <in.vf> ...
                                               relabel with the Syzygy tables: --fix-result sets each game's
                                               result to the table result at its first table position with a
                                               fresh fifty-move clock (as tbstats); --score CP sets the score of
                                               every scored table position to +-CP (win/loss, side to move) or 0
                                               (draw); --score-dtz grades wins from HI at DTZ 0 to LO at DTZ 100
                                               plies, plus PER_PAWN per pawn of material lead; --score-keep CP
-                                              keeps the search score when it shows the win by >= CP, else +-CP
+                                              keeps the search score when it shows the win by >= CP, else +-CP;
+                                              --score-grade: a target in the net's output units, LO + PER per
+                                              unit of progress (material lead, 0.2 per pawn rank, DTZ to D plies
+                                              when pawnless), capped at CAP, stored as +-(10000 + target) for
+                                              incipit-train-v2 tbt= (only on calibrated copies);
+                                              --label-unscored also scores table positions stored
+                                              unscored (a mate score in games played out without
+                                              tables), which are otherwise left alone
   datatools wdlstats <out.csv> <in.vf> ...    win/draw/loss counts by (material, eval), side to move,
                                               for fitting a WDL model (from ply 16, not in check, scored)
   datatools wdlfit <stats.csv>                 fit the WDL model to wdlstats output (maximum likelihood)
   datatools rescale <factor> <out_dir> <in.vf> ...
                                               multiply every score by <factor> (unscored positions
                                               unchanged), writing <out_dir>/<same name> per input
-  datatools calibrate <a0,a1,a2,a3> <b0,b1,b2,b3> <out_dir> <in.vf> ...
+  datatools calibrate [--band E0,E1,T] <a0,a1,a2,a3> <b0,b1,b2,b3> <out_dir> <in.vf> ...
                                               replace each score x by 400 logit(E(x)), E the expected
                                               score under the set's WDL model (wdlfit's a and b), so
                                               sigmoid(score / 400) is the label's calibrated
                                               probability; unscored positions unchanged
-                                              (writes <out_dir>/CALIBRATED, which incipit-train-v2 requires)
+                                              (writes <out_dir>/CALIBRATED, which incipit-train-v2 requires);
+                                              --band E0,E1,T (cal3): above expected score E0 keep rising with
+                                              the raw score towards E1 (scale T cp) instead of clamping
+  datatools ridgecheck <a0..a3> <b0..b3> <E0,E1,T> <in.vf> ...
+                                              in decisive games, how often the winner's label falls between
+                                              its consecutive positions while the raw score does not, under
+                                              cal2 and cal3 (any capture / trade into <= 5 pieces broken out)
   datatools bishopstats <out.csv> <in.vf> ... one bishop a side: opposite- vs same-coloured, score and result
                                               by pawn lead (side to move), to check how nets score OCB endings
   datatools matstats <out.csv> <in.vf> ...    stored score and result by material lead, side to move,
@@ -135,6 +151,7 @@ fn main() {
         Some("bin") if args.len() >= 4 => cmd_bin(&args[2], &args[3..]),
         Some("stats") if args.len() >= 3 => cmd_stats(&args[2..]),
         Some("heldout") if args.len() >= 4 => cmd_heldout(&args[2], &args[3..]),
+        Some("gamedump") if args.len() >= 4 => cmd_gamedump(&args[2], &args[3..]),
         Some("plystats") if args.len() >= 3 => cmd_plystats(&args[2..]),
         Some("structstats") if args.len() >= 3 => cmd_structstats(&args[2..]),
         Some("tbstats") if args.len() >= 4 => cmd_tbstats(&args[2], &args[3..]),
@@ -147,7 +164,11 @@ fn main() {
         Some("bishopstats") if args.len() >= 4 => cmd_bishopstats(&args[2], &args[3..]),
         Some("wdlfit") if args.len() >= 3 => cmd_wdlfit(&args[2]),
         Some("rescale") if args.len() >= 5 => cmd_rescale(&args[2], &args[3], &args[4..]),
-        Some("calibrate") if args.len() >= 6 => cmd_calibrate(&args[2], &args[3], &args[4], &args[5..]),
+        Some("calibrate") if args.len() >= 8 && args[2] == "--band" => {
+            cmd_calibrate(&args[4], &args[5], &args[6], &args[7..], Some(&args[3]))
+        }
+        Some("ridgecheck") if args.len() >= 6 => cmd_ridgecheck(&args[2], &args[3], &args[4], &args[5..]),
+        Some("calibrate") if args.len() >= 6 => cmd_calibrate(&args[2], &args[3], &args[4], &args[5..], None),
         Some("net") if args.len() >= 5 => cmd_net(&args[2], &args[3], &args[4], &args[5..]),
         Some("net-info") if args.len() >= 3 => cmd_net_info(&args[2..]),
         Some("fens") if args.len() >= 5 => cmd_fens(&args[2], &args[3], &args[4..]),
@@ -419,43 +440,168 @@ fn cmd_setscores(scores: &str, out_dir: &str, input: &str) -> Result<(), String>
 /// trainer's target sigmoid(score / 400) is then the label's probability of
 /// the outcome as the set's own games measured it, whatever eval scale the
 /// labelling net had.
-fn cmd_calibrate(a: &str, b: &str, out_dir: &str, inputs: &[String]) -> Result<(), String> {
-    let coef = |s: &str| -> Result<[f64; 4], String> {
-        let v: Vec<f64> = s
-            .split(',')
-            .map(|x| x.trim().parse::<f64>())
-            .collect::<Result<_, _>>()
-            .map_err(|_| format!("bad coefficients {}", s))?;
-        v.try_into().map_err(|_| format!("need 4 coefficients, got {}", s))
-    };
-    let (ca, cb) = (coef(a)?, coef(b)?);
-    let poly = |c: &[f64; 4], m: f64| ((c[0] * m + c[1]) * m + c[2]) * m + c[3];
-    // Reject a model that isn't finite over the material range (NaN would
-    // otherwise turn every label into 0 without an error).
-    if ca.iter().chain(&cb).any(|c| !c.is_finite())
-        || (17..=78).any(|mat| {
-            let m = mat as f64 / 58.0;
-            !poly(&ca, m).is_finite() || !poly(&cb, m).is_finite()
-        })
-    {
-        return Err("calibrate: the coefficients must be finite (and give finite a, b for material 17..78)".into());
+/// The calibrated label transform (cal2), optionally with a decisive band (cal3).
+///
+/// cal2 replaces a search score x by 400 logit(E(x)), E the expected score under the set's WDL model, clamped
+/// at 1e-4. Decisive scores all reach that clamp, so every won position gets the same label (the ceiling 3684)
+/// and the network learns no difference between a pawn up and a queen up, or a long win and a mate in two.
+/// The band (E0, E1, T) keeps cal2 below E(x) = E0 and above it maps E0 + (E1 - E0)(1 - exp(-(|x| - x0) / T)),
+/// x0 the score where E reaches E0 at this material: continuous at the knee and rising with the raw score
+/// everywhere, so a label is never below that of a position with a lower raw score at the same material.
+/// docs/decisive-labels.md (incipit-research) has the reasoning and the checks.
+struct Calib {
+    ca: [f64; 4],
+    cb: [f64; 4],
+    band: Option<(f64, f64, f64)>,
+}
+
+impl Calib {
+    fn new(a: &str, b: &str, band: Option<&str>) -> Result<Calib, String> {
+        let coef = |s: &str| -> Result<Vec<f64>, String> {
+            s.split(',')
+                .map(|x| x.trim().parse::<f64>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| format!("bad coefficients {}", s))
+        };
+        let four = |s: &str| -> Result<[f64; 4], String> {
+            coef(s)?.try_into().map_err(|_| format!("need 4 coefficients, got {}", s))
+        };
+        let c = Calib {
+            ca: four(a)?,
+            cb: four(b)?,
+            band: match band {
+                None => None,
+                Some(s) => {
+                    let v = coef(s)?;
+                    let [e0, e1, t] = v[..] else { return Err(format!("--band needs E0,E1,T, got {}", s)) };
+                    if !(0.5 < e0 && e0 < e1 && e1 < 1.0 - 1e-4 && t > 0.0) {
+                        return Err(format!("--band needs 0.5 < E0 < E1 < 0.9999 and T > 0, got {}", s));
+                    }
+                    Some((e0, e1, t))
+                }
+            },
+        };
+        // Reject a model that isn't finite over the material range (NaN would
+        // otherwise turn every label into 0 without an error).
+        if c.ca.iter().chain(&c.cb).any(|x| !x.is_finite())
+            || (17..=78).any(|mat| {
+                let m = mat as f64 / 58.0;
+                !Self::poly(&c.ca, m).is_finite() || !Self::poly(&c.cb, m).is_finite()
+            })
+        {
+            return Err("calibrate: the coefficients must be finite (and give finite a, b for material 17..78)".into());
+        }
+        Ok(c)
     }
-    let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
-    let map = |pos: &position::Position, s: i16| -> i16 {
+
+    fn poly(c: &[f64; 4], m: f64) -> f64 {
+        ((c[0] * m + c[1]) * m + c[2]) * m + c[3]
+    }
+
+    /// The label of stored score `s` (white's view, as stored) at `pos`, white's view.
+    fn label(&self, pos: &position::Position, s: i16) -> i16 {
         if s == viri::NO_SCORE {
             return s;
         }
+        let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
         let m = (material(pos) as f64).clamp(17.0, 78.0) / 58.0;
-        let (am, bm) = (poly(&ca, m), poly(&cb, m).max(1.0));
+        let (am, bm) = (Self::poly(&self.ca, m), Self::poly(&self.cb, m).max(1.0));
+        let ex = |x: f64| 0.5 + 0.5 * (sig((x - am) / bm) - sig((-x - am) / bm));
         let x = if pos.stm == position::WHITE { s as f64 } else { -(s as f64) };
-        let e = (0.5 + 0.5 * (sig((x - am) / bm) - sig((-x - am) / bm))).clamp(1e-4, 1.0 - 1e-4);
+        let mut e = ex(x);
+        if let Some((e0, e1, t)) = self.band {
+            let ax = x.abs();
+            if ex(ax) > e0 {
+                // x0: E(x0) = E0, by bisection on [0, |x|] (E rises with x).
+                let (mut lo, mut hi) = (0.0, ax);
+                for _ in 0..50 {
+                    let mid = 0.5 * (lo + hi);
+                    if ex(mid) > e0 {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                let eb = e0 + (e1 - e0) * (1.0 - (-(ax - hi) / t).exp());
+                e = if x >= 0.0 { eb } else { 1.0 - eb };
+            }
+        }
+        let e = e.clamp(1e-4, 1.0 - 1e-4);
         let y = (400.0 * (e / (1.0 - e)).ln()).round() as i16;
         if pos.stm == position::WHITE {
             y
         } else {
             -y
         }
-    };
+    }
+}
+
+/// The no-ridge check for a label transform: along the winner's consecutive positions in decisive games
+/// (two plies apart), count steps where the raw search score does not fall but the label falls by more than
+/// 25 (label units, about 6% of a pawn), for cal2 and for cal3 with `band`. Steps across a capture and
+/// steps into five pieces or fewer are counted separately, since the transform depends on material.
+fn cmd_ridgecheck(a: &str, b: &str, band: &str, inputs: &[String]) -> Result<(), String> {
+    let cal2 = Calib::new(a, b, None)?;
+    let cal3 = Calib::new(a, b, Some(band))?;
+    // [all, capture, into <= 5 pieces] x [steps, cal2 drops, cal3 drops, raw drops]
+    let mut n = [[0u64; 4]; 3];
+    for input in inputs {
+        let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
+        viri::for_each_game_scored(&data, |game, wdl| {
+            if wdl == 1 {
+                return;
+            }
+            let winner = if wdl == 2 { position::WHITE } else { position::WHITE ^ 1 };
+            let pov = |v: i16| if winner == position::WHITE { v as i32 } else { -(v as i32) };
+            let mut prev: Option<(i32, i32, i32, u32)> = None;
+            for (pos, _, score) in game {
+                if *score == viri::NO_SCORE || pos.stm != winner || pos.checkers != 0 {
+                    continue;
+                }
+                let (raw, l2, l3) = (pov(*score), pov(cal2.label(pos, *score)), pov(cal3.label(pos, *score)));
+                let pieces = pos.occ().count_ones();
+                if let Some((praw, p2, p3, ppieces)) = prev {
+                    let kinds = [true, pieces < ppieces, pieces <= 5 && ppieces > 5];
+                    for (k, &on) in kinds.iter().enumerate() {
+                        if !on {
+                            continue;
+                        }
+                        n[k][0] += 1;
+                        if raw < praw {
+                            n[k][3] += 1;
+                            continue;
+                        }
+                        n[k][1] += (l2 < p2 - 25) as u64;
+                        n[k][2] += (l3 < p3 - 25) as u64;
+                    }
+                }
+                prev = Some((raw, l2, l3, pieces));
+            }
+        })?;
+    }
+    println!(
+        "winner's consecutive positions in decisive games; a ridge step = raw score not lower, label lower by > 25"
+    );
+    for (k, name) in ["all steps", "across a capture", "into <= 5 pieces"].iter().enumerate() {
+        let [steps, d2, d3, rawd] = n[k];
+        let held = (steps - rawd).max(1) as f64;
+        println!(
+            "{:<18} steps {:>10}  raw falls {:>9}  ridge steps: cal2 {:>8} ({:.3}%)  cal3 {:>8} ({:.3}%)",
+            name,
+            steps,
+            rawd,
+            d2,
+            100.0 * d2 as f64 / held,
+            d3,
+            100.0 * d3 as f64 / held
+        );
+    }
+    Ok(())
+}
+
+fn cmd_calibrate(a: &str, b: &str, out_dir: &str, inputs: &[String], band: Option<&str>) -> Result<(), String> {
+    let cal = Calib::new(a, b, band)?;
+    let map = |pos: &position::Position, s: i16| -> i16 { cal.label(pos, s) };
     let dests = output_paths(out_dir, inputs)?;
     std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {}", out_dir, e))?;
     let next = AtomicUsize::new(0);
@@ -707,6 +853,54 @@ fn cmd_heldout(every: &str, inputs: &[String]) -> Result<(), String> {
             let r = if white { wdl } else { 2 - wdl };
             let s = if white { score as i32 } else { -(score as i32) };
             let _ = writeln!(out, "{}\t{}\t{}", pos.to_fen(), r as f32 / 2.0, s);
+        })?;
+    }
+    Ok(())
+}
+
+/// Every Nth position the trainer would use (as `heldout`), with where it sits in its game: how many plies
+/// are left to the game's end, the material lead and the result. For checking whether the distance to a
+/// decisive result can grade won positions whose scores have saturated.
+fn cmd_gamedump(every: &str, inputs: &[String]) -> Result<(), String> {
+    use position::{BISHOP, KNIGHT, PAWN, QUEEN, ROOK};
+    const VALUE: [(usize, i32); 5] = [(PAWN, 1), (KNIGHT, 3), (BISHOP, 3), (ROOK, 5), (QUEEN, 9)];
+    let every: u64 = every.parse().map_err(|_| format!("bad count {}", every))?;
+    let (mut n, mut g) = (0u64, 0u64);
+    let out = std::io::stdout();
+    let mut out = std::io::BufWriter::new(out.lock());
+    for input in inputs {
+        let data = std::fs::read(input).map_err(|e| format!("{}: {}", input, e))?;
+        viri::for_each_game_scored(&data, |game, wdl| {
+            g += 1;
+            let len = game.len();
+            for (k, (pos, m, score)) in game.iter().enumerate() {
+                let ply = 2 * (pos.fullmove as i32 - 1) + (pos.stm != position::WHITE) as i32;
+                if *score == viri::NO_SCORE || pos.checkers != 0 || ply < 16 || position::is_noisy(*m) {
+                    continue;
+                }
+                n += 1;
+                if !n.is_multiple_of(every) {
+                    continue;
+                }
+                let us = pos.stm;
+                let mat = |c: usize| {
+                    VALUE.iter().map(|&(pt, v)| v * (pos.pieces[pt] & pos.colors[c]).count_ones() as i32).sum::<i32>()
+                };
+                let white = us == position::WHITE;
+                let r = if white { wdl } else { 2 - wdl };
+                let s = if white { *score as i32 } else { -(*score as i32) };
+                let _ = writeln!(
+                    out,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    g,
+                    ply,
+                    len - k,
+                    pos.occ().count_ones(),
+                    mat(us) - mat(us ^ 1),
+                    s,
+                    r as f32 / 2.0
+                );
+            }
         })?;
     }
     Ok(())
@@ -1052,7 +1246,18 @@ enum TbLabel {
     /// The search score when it already shows the win at least this clearly,
     /// else this value.
     Keep(i32),
+    /// A target in the net's output units (incipit-train-v2 `tbt=`), stored as
+    /// 10000 + target: `lo + per * x`, capped at `cap`, with x in pawns =
+    /// material lead + 0.2 per rank each of the winner's pawns has advanced +
+    /// (pawnless winner) 1 - min(DTZ, d) / d, kept below 1 (else 0.5). Every
+    /// winner capture adds >= 1 to the lead and changes the DTZ term by < 1, a
+    /// pawn push adds rank progress with the DTZ term fixed, and a promotion
+    /// adds >= 2, so the target never falls along the winner's progress.
+    Grade { lo: i32, per: i32, d: i32, cap: i32 },
 }
+
+/// Stored score of a `Grade` target: above any calibrated label (|label| <= 3684).
+const TBT_BASE: i32 = 10000;
 
 impl TbLabel {
     /// `sign`: +1 white wins, -1 black wins (0: draw, label 0). `search`:
@@ -1075,6 +1280,30 @@ impl TbLabel {
                 (base + per_pawn * sign * lead).max(lo / 2)
             }
             TbLabel::Keep(cp) => (sign * search).max(cp),
+            TbLabel::Grade { lo, per, d, cap } => {
+                let w = if sign > 0 { position::WHITE } else { position::BLACK };
+                let values = [1, 3, 3, 5, 9];
+                let lead: i32 = (0..5)
+                    .map(|pc| {
+                        let n = |c: usize| (p.pieces[pc] & p.colors[c]).count_ones() as i32;
+                        values[pc] * (n(w) - n(w ^ 1))
+                    })
+                    .sum();
+                // Progress in thousandths of a pawn.
+                let (mut pawns, mut steps) = (p.pieces[0] & p.colors[w], 0);
+                while pawns != 0 {
+                    let rank = pawns.trailing_zeros() as i32 / 8;
+                    steps += if w == position::WHITE { rank - 1 } else { 6 - rank };
+                    pawns &= pawns - 1;
+                }
+                let g = if p.pieces[0] & p.colors[w] != 0 {
+                    500
+                } else {
+                    (1000 - 1000 * (dtz as i32).min(d) / d).min(999)
+                };
+                let x = (1000 * lead + 200 * steps + g).max(0);
+                TBT_BASE + (lo + per * x / 1000).min(cap)
+            }
         }
     }
 }
@@ -1142,6 +1371,7 @@ fn cmd_tbrelabel(tb_path: &str, out_dir: &str, args: &[String]) -> Result<(), St
         return Err(format!("no tablebases found in {}", tb_path));
     }
     let (mut fix_result, mut label, mut inputs) = (false, None, Vec::new());
+    let mut label_unscored = false;
     let mut it = args.iter();
     let cp = |it: &mut std::slice::Iter<String>, flag: &str| -> Result<i32, String> {
         let v: i32 = it.next().and_then(|v| v.parse().ok()).ok_or(format!("{} needs cp values", flag))?;
@@ -1153,11 +1383,19 @@ fn cmd_tbrelabel(tb_path: &str, out_dir: &str, args: &[String]) -> Result<(), St
     while let Some(a) = it.next() {
         match a.as_str() {
             "--fix-result" => fix_result = true,
+            "--label-unscored" => label_unscored = true,
             "--score" => label = Some(TbLabel::Flat(cp(&mut it, a)?)),
             "--score-dtz" => {
                 label = Some(TbLabel::Dtz { lo: cp(&mut it, a)?, hi: cp(&mut it, a)?, per_pawn: cp(&mut it, a)? })
             }
             "--score-keep" => label = Some(TbLabel::Keep(cp(&mut it, a)?)),
+            "--score-grade" => {
+                let (lo, per, d, cap) = (cp(&mut it, a)?, cp(&mut it, a)?, cp(&mut it, a)?, cp(&mut it, a)?);
+                if d == 0 || cap > 9000 {
+                    return Err("--score-grade needs D > 0 and CAP <= 9000".into());
+                }
+                label = Some(TbLabel::Grade { lo, per, d, cap })
+            }
             _ => inputs.push(a.clone()),
         }
     }
@@ -1194,7 +1432,7 @@ fn cmd_tbrelabel(tb_path: &str, out_dir: &str, args: &[String]) -> Result<(), St
             }
             if let Some(label) = label {
                 for (k, (p, s)) in game.iter().enumerate() {
-                    if *s == viri::NO_SCORE || !in_tb(p) {
+                    if (*s == viri::NO_SCORE && !label_unscored) || !in_tb(p) {
                         continue;
                     }
                     // Probed with a fresh fifty-move count; with a running clock
@@ -1202,7 +1440,7 @@ fn cmd_tbrelabel(tb_path: &str, out_dir: &str, args: &[String]) -> Result<(), St
                     let mut q = *p;
                     q.halfmove = 0;
                     let Some((r, dtz)) = (match label {
-                        TbLabel::Dtz { .. } => tb::probe_dtz(&q),
+                        TbLabel::Dtz { .. } | TbLabel::Grade { .. } => tb::probe_dtz(&q),
                         _ => tb::probe_wdl(&q).map(|r| (r, 0)),
                     }) else {
                         failed += 1;
