@@ -1,8 +1,13 @@
-
 name: Android Development Build
 
 on:
   workflow_dispatch:
+    inputs:
+      uci_date:
+        description: "UCI engine version/date (YYYYMMDD)"
+        required: true
+        default: "20261127"
+        type: string
   push:
     branches:
       - main
@@ -16,7 +21,7 @@ permissions:
 
 jobs:
   android-arm64:
-    name: Incipit Android ARM64
+    name: Incipit Android ARM64 (NEON + runtime DotProd)
     runs-on: ubuntu-latest
 
     steps:
@@ -24,6 +29,60 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 50
+
+      - name: Set UCI date version
+        id: version-stamp
+        shell: bash
+        env:
+          UCI_DATE_INPUT: ${{ inputs.uci_date }}
+        run: |
+          set -euo pipefail
+
+          UCI_DATE="$UCI_DATE_INPUT"
+          if [[ -z "$UCI_DATE" ]]; then
+            UCI_DATE="$(date -u +%Y%m%d)"
+          fi
+
+          python3 - "$UCI_DATE" <<'PY'
+          import sys
+          from datetime import datetime
+
+          value = sys.argv[1]
+          try:
+              datetime.strptime(value, "%Y%m%d")
+          except ValueError:
+              raise SystemExit("UCI date must be a valid calendar date in YYYYMMDD format")
+          if len(value) != 8 or not value.isdigit():
+              raise SystemExit("UCI date must use YYYYMMDD format")
+          PY
+
+          python3 - "$UCI_DATE" <<'PY'
+          import sys
+          from pathlib import Path
+
+          date = sys.argv[1]
+          path = Path("engine/build.rs")
+          source = path.read_text()
+          old = '    println!("cargo:rustc-env=INCIPIT_VERSION={v}");'
+          new = '\n'.join([
+              '    println!("cargo:rerun-if-env-changed=UCI_DATE");',
+              '    println!(',
+              '        "cargo:rustc-env=INCIPIT_VERSION={}",',
+              '        env::var("UCI_DATE").unwrap_or(v)',
+              '    );',
+          ])
+          if source.count(old) != 1:
+              raise SystemExit(
+                  f"Expected exactly one INCIPIT_VERSION stamping line in {path}; "
+                  f"found {source.count(old)}. Refusing to patch unexpected source."
+              )
+          path.write_text(source.replace(old, new, 1))
+          print(f"CI-only build.rs patch: UCI version will be Incipit {date}")
+          PY
+
+          echo "UCI_DATE=$UCI_DATE" >> "$GITHUB_ENV"
+          echo "uci_date=$UCI_DATE" >> "$GITHUB_OUTPUT"
+          echo "UCI version: Incipit $UCI_DATE"
 
       - name: Install Rust
         shell: bash
@@ -34,6 +93,13 @@ jobs:
           rustup target add aarch64-linux-android
           rustc --version
           cargo --version
+
+          RUST_MINOR="$(rustc --version | awk '{ split($2, v, /\./); print v[2] }')"
+          if [[ ! "$RUST_MINOR" =~ ^[0-9]+$ ]] || (( RUST_MINOR < 98 )); then
+            echo "::error::Incipit's ARM DotProd intrinsics require Rust 1.98 or newer."
+            exit 1
+          fi
+          echo "Verified Rust 1.$RUST_MINOR supports the ARM DotProd code."
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -57,26 +123,28 @@ jobs:
 
           CC="$BIN/aarch64-linux-android24-clang"
           AR="$BIN/llvm-ar"
-
+          OBJDUMP="$BIN/llvm-objdump"
           test -x "$CC"
           test -x "$AR"
+          test -x "$OBJDUMP"
 
           echo "ANDROID_CC=$CC" >> "$GITHUB_ENV"
           echo "ANDROID_AR=$AR" >> "$GITHUB_ENV"
+          echo "ANDROID_OBJDUMP=$OBJDUMP" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CC" >> "$GITHUB_ENV"
 
           echo "Android compiler:"
           "$CC" --version
-
           echo "Android archiver:"
           "$AR" --version
 
       - name: Download NNUE network
         working-directory: engine
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           sudo apt-get update
           sudo apt-get install -y make curl
 
@@ -97,31 +165,31 @@ jobs:
 
           NET="$PWD/$(basename "$(cat net.txt)")"
           test -s "$NET"
-
-          # Remove stale host-compiled objects and libraries.
           cargo clean
 
-          # Native C compilation and archiving for Fathom.
+          # Fathom is compiled for Android by build.rs, not for the Linux runner.
           export CC="$ANDROID_CC"
           export AR="$ANDROID_AR"
           export EVALFILE="$NET"
 
-          # Configure the target-specific Cargo linker.
+          # Keep generic AArch64 as the binary baseline. Incipit compiles its
+          # DotProd kernels with function-level target_feature attributes and
+          # selects SDOT at runtime only when the CPU reports dotprod support.
           mkdir -p .cargo
-
           cat > .cargo/config.toml <<EOF
           [target.aarch64-linux-android]
           linker = "$ANDROID_CC"
           EOF
-
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_CC"
           export RUSTFLAGS="-C target-cpu=generic"
 
           echo "Target: aarch64-linux-android"
+          echo "UCI ID: Incipit $UCI_DATE"
           echo "C compiler: $CC"
           echo "Archiver: $AR"
           echo "Linker: $CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
           echo "NNUE: $EVALFILE"
+          echo "Rust flags: $RUSTFLAGS"
 
           cargo build \
             --release \
@@ -132,15 +200,44 @@ jobs:
           test -s "$BINARY"
 
           mkdir -p ../dist
-          cp "$BINARY" ../dist/incipit-android-arm64
+          cp "$BINARY" "../dist/incipit-android-arm64-$UCI_DATE"
+          chmod +x "../dist/incipit-android-arm64-$UCI_DATE"
 
-          file ../dist/incipit-android-arm64
-          ls -lh ../dist/incipit-android-arm64
+      - name: Verify Android ARM64 and DotProd binary
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Upload Android development binary
+          BINARY="dist/incipit-android-arm64-$UCI_DATE"
+          test -s "$BINARY"
+          file "$BINARY"
+
+          readelf -h "$BINARY" | grep -E 'Class:|Data:|Machine:|Type:'
+          readelf -h "$BINARY" | grep -q 'Machine:.*AArch64' || {
+            echo "::error::Binary is not AArch64"
+            exit 1
+          }
+
+          if ! strings "$BINARY" | grep -Fq "Incipit $UCI_DATE"; then
+            echo "::error::UCI date version string was not found in the binary"
+            exit 1
+          fi
+          echo "Verified UCI engine name: Incipit $UCI_DATE"
+
+          "$ANDROID_OBJDUMP" -d "$BINARY" > /tmp/incipit-android-disassembly.txt
+          if ! grep -Eiq '(^|[[:space:]])sdot[[:space:]]' /tmp/incipit-android-disassembly.txt; then
+            echo "::error::No SDOT instruction found; DotProd kernel was not emitted"
+            exit 1
+          fi
+          echo "Verified: SDOT DotProd instructions are present."
+
+          sha256sum "$BINARY"
+          ls -lh "$BINARY"
+
+      - name: Upload Android artifact
         uses: actions/upload-artifact@v4
         with:
-          name: incipit-android-arm64
-          path: dist/incipit-android-arm64
+          name: incipit-android-arm64-${{ steps.version-stamp.outputs.uci_date }}
+          path: dist/incipit-android-arm64-${{ steps.version-stamp.outputs.uci_date }}
           if-no-files-found: error
           retention-days: 30
